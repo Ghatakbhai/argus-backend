@@ -79,3 +79,47 @@ GITHUB_SETUP_SECRET = os.environ.get("ARGUS_GITHUB_SETUP_SECRET", "dev-setup-sec
 # admin has to reissue it. Generous, because it is a one-click link Claude
 # hands to a non-technical pilot contact, not a live session.
 INSTALL_CLAIM_TTL_SECONDS = int(os.environ.get("ARGUS_INSTALL_CLAIM_TTL_SECONDS", str(7 * 24 * 3600)))
+
+# --- Phase 7.3: the Slack app's own credentials ---------------------------
+# ONE Slack app, installed by N pilot workspaces (Slack calls this
+# "distribution"). Exactly like the GitHub App above, these are deployment
+# credentials rather than tenant data, so they live in the host environment
+# and never in Postgres. What DOES go in Postgres is each workspace's own bot
+# token, encrypted — see slack_crypto.py and D-143.
+SLACK_CLIENT_ID = os.environ.get("ARGUS_SLACK_CLIENT_ID")
+SLACK_CLIENT_SECRET = os.environ.get("ARGUS_SLACK_CLIENT_SECRET")
+SLACK_SIGNING_SECRET = os.environ.get("ARGUS_SLACK_SIGNING_SECRET")
+
+# The key that encrypts every workspace bot token at rest. Any string works —
+# slack_crypto derives a 32-byte AES key from it by SHA-256 — so Render's
+# "Generate Value" can produce it with no typing and no format rules for a
+# non-technical owner to get wrong. Losing it means every pilot workspace has
+# to reinstall; it does NOT mean anyone else can read the tokens.
+SLACK_TOKEN_KEY = os.environ.get("ARGUS_SLACK_TOKEN_KEY")
+
+# This service's own public URL. Slack requires the OAuth redirect_uri to
+# match the one registered on the app exactly, so it cannot be inferred from
+# the incoming request (a proxy, a custom domain, or a stray trailing slash
+# would each silently break the exchange).
+PUBLIC_BASE_URL = os.environ.get("ARGUS_PUBLIC_BASE_URL", "").rstrip("/")
+
+# Every scope the pilot needs, requested once at install.
+#
+# 6.5 took the opposite approach deliberately — request only what the current
+# step uses, add more later — and that was right for one hand-installed
+# workspace. It is wrong for a distributed app: Slack has no way to add a
+# scope to an existing install, so every widening forces all fifteen pilot
+# teams to reinstall. The 6.7 presence scope (`users.profile:read`), which 6.5
+# consciously left out and planned to add later, is included here for exactly
+# that reason (D-145).
+SLACK_BOT_SCOPES = ",".join([
+    "chat:write",            # send the triage DM
+    "im:write",              # open a DM conversation with someone
+    "users:read",            # look up a Slack account
+    "users:read.email",      # match that account to a GitHub/Jira identity
+    "users.profile:read",    # step 6.7's out-of-office suppression
+])
+
+# Slack's own documented replay window for signed requests.
+SLACK_REQUEST_MAX_AGE_SECONDS = int(
+    os.environ.get("ARGUS_SLACK_REQUEST_MAX_AGE_SECONDS", "300"))
