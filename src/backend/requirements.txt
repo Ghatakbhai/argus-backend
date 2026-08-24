@@ -1,0 +1,10 @@
+# Pinned to what step 7.2 actually built and tested against (44 Phase 7.1
+# checks + 23 new Phase 7.2 checks, 67 total, all passing).
+fastapi==0.141.*
+uvicorn[standard]==0.46.*
+psycopg[binary]==3.3.*
+psycopg_pool==3.3.*
+pydantic==2.13.*
+PyJWT==2.12.*
+cryptography==46.*
+httpx==0.28.*
