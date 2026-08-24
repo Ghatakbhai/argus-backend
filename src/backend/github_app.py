@@ -58,7 +58,11 @@ def build_manifest(base_url: str) -> dict[str, Any]:
     base_url = base_url.rstrip("/")
     return {
         "name": "ARGUS Stall Radar",
-        "url": "https://github.com/apps/argus-stall-radar",  # informational; not load-bearing
+        # GitHub's own confirmation page links this as the App's homepage.
+        # A guessed github.com/apps/... slug would 404 until the App exists
+        # (if it ever resolves at all) — the backend's own real, live URL is
+        # correct immediately and always.
+        "url": base_url,
         "hook_attributes": {"url": f"{base_url}/v1/webhooks/github"},
         "redirect_url": f"{base_url}/v1/admin/github/callback",
         "setup_url": f"{base_url}/v1/github/setup",
