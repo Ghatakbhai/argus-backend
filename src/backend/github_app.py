@@ -75,8 +75,6 @@ def build_manifest(base_url: str) -> dict[str, Any]:
             "metadata": "read",
         },
         "default_events": [
-            "installation",
-            "installation_repositories",
             "issues",
             "issue_comment",
             "pull_request",
