@@ -46,3 +46,13 @@ services:
         sync: false
       - key: ARGUS_GITHUB_APP_PRIVATE_KEY
         sync: false
+
+      # --- Phase 7.3: the Slack app ----------------------------------------
+      - key: ARGUS_SLACK_TOKEN_KEY      # encrypts every workspace bot token at rest
+        generateValue: true
+      - key: ARGUS_SLACK_CLIENT_ID      # Slack -> Basic Information -> App Credentials
+        sync: false
+      - key: ARGUS_SLACK_CLIENT_SECRET
+        sync: false
+      - key: ARGUS_SLACK_SIGNING_SECRET # proves an inbound request really came from Slack
+        sync: false
