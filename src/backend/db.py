@@ -22,6 +22,15 @@ from . import config
 _app_pool: ConnectionPool | None = None
 _admin_pool: ConnectionPool | None = None
 
+# Migration files applied on EVERY boot, in order, after the one-time
+# schema_pg.sql/roles.sql pair. See the note in bootstrap_schema_if_needed()
+# and D-141: a phase that ships after the first deployment cannot reach the
+# live database through schema_pg.sql, which only ever runs against an empty
+# one. Anything added here must be idempotent — IF NOT EXISTS, CREATE OR
+# REPLACE, or guarded by a catalogue lookup — because it will be re-run every
+# time the service restarts.
+INCREMENTAL_MIGRATIONS = ("schema_7_3_slack.sql",)
+
 
 def bootstrap_schema_if_needed() -> bool:
     """Applies schema_pg.sql then roles.sql to a brand-new database exactly
@@ -53,11 +62,11 @@ def bootstrap_schema_if_needed() -> bool:
     """
     if not config.OWNER_DSN:
         return False
+    here = os.path.dirname(os.path.abspath(__file__))
     with psycopg.connect(config.OWNER_DSN, autocommit=True) as conn:
         already = conn.execute("SELECT to_regclass('public.tenant')").fetchone()[0]
         just_migrated = not already
         if just_migrated:
-            here = os.path.dirname(os.path.abspath(__file__))
             for fname in ("schema_pg.sql", "roles.sql"):
                 with open(os.path.join(here, fname)) as f:
                     # One `execute()` per file, not per statement: psycopg
@@ -65,6 +74,18 @@ def bootstrap_schema_if_needed() -> bool:
                     # query" protocol message, which (like `psql -f`) allows
                     # multiple ;-separated statements in one call.
                     conn.execute(f.read())
+
+        # Phase 7.3 (D-141): everything above runs ONCE, on an empty
+        # database — which the live one no longer is. Anything added after
+        # the first deployment therefore has to arrive through a file that
+        # is safe to re-apply and IS re-applied on every boot. Each of these
+        # is idempotent and ends with the same "is RLS forced on every data
+        # table?" assertion schema_pg.sql ends with, so a migration that only
+        # half-applied fails the boot rather than letting the service run
+        # against a table with no isolation on it.
+        for fname in INCREMENTAL_MIGRATIONS:
+            with open(os.path.join(here, fname)) as f:
+                conn.execute(f.read())
         # ALTER ROLE's PASSWORD clause is a literal in the grammar, not a
         # bindable value — sql.Literal() is psycopg's safe way to quote one
         # in without hand-rolling escaping.
