@@ -19,16 +19,17 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, github_app
+from . import config, db, github_app, slack_app, slack_crypto
 from .auth import TenantContext, generate_key, hash_key, now_iso
 
 
@@ -189,14 +190,14 @@ async def lifespan(app: FastAPI):
     db.close_pools()
 
 
-app = FastAPI(title="ARGUS", version="7.2", lifespan=lifespan)
+app = FastAPI(title="ARGUS", version="7.3", lifespan=lifespan)
 
 
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
     with db.unbound_app_tx() as conn:
         conn.execute("SELECT 1")
-    return {"status": "ok", "phase": "7.2"}
+    return {"status": "ok", "phase": "7.3"}
 
 
 # --- control plane ---------------------------------------------------------
@@ -472,8 +473,8 @@ def create_github_install_link(slug: str, _: Admin) -> InstallLinkOut:
     try:
         with db.admin_tx() as conn:
             conn.execute(
-                "SELECT argus_admin_create_install_claim(%s,%s,%s,%s)",
-                (slug, token_hash, created, expires_at),
+                "SELECT argus_admin_mint_install_claim(%s,%s,%s,%s,%s)",
+                (slug, token_hash, created, expires_at, "github"),
             )
     except psycopg.errors.RaiseException:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such tenant")
@@ -630,3 +631,342 @@ async def github_webhook(request: Request) -> dict[str, Any]:
         _audit(conn, tenant_id, f"installation:{installation_id}", "webhook.received", "ok",
                f"{event_type}.{action}")
     return {"status": "ok", "event": event_type, "action": action, "ingest_run_id": ingest_run_id}
+
+
+# ============================================================================
+# Slack: multi-workspace install, events, interactivity (Phase 7.3)
+#
+# Five endpoints, and — as with GitHub at 7.2 — not one of them can carry a
+# pilot team's API key, because the caller is Slack or a browser mid-install:
+#
+#   POST /v1/admin/tenants/{slug}/slack/install-link
+#                             an ARGUS admin, minting the one-time link.
+#   GET  /v1/slack/install    a pilot contact's browser, once. Checks the
+#                             claim BEFORE sending them to Slack.
+#   GET  /v1/slack/oauth/callback
+#                             Slack's redirect back, carrying the code that
+#                             becomes that workspace's bot token.
+#   POST /v1/slack/events     Slack's servers, forever after.
+#   POST /v1/slack/interactions
+#                             Slack's servers, on every button and dialog.
+#
+# The last two are authenticated by Slack's request signature (HMAC over the
+# raw body, inside a five-minute window); the middle two by the one-time
+# claim token; the first by the admin secret. Same three-way split 7.2 used.
+# ============================================================================
+
+
+def _slack_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+    """One place that decides what a pilot contact sees mid-install.
+
+    These pages are read by a non-technical person in the middle of setting
+    ARGUS up for their team. Every one of them says what happened and what to
+    do next, and none of them shows a stack trace, an internal id, or another
+    tenant's name.
+    """
+    return HTMLResponse(
+        f"<h1>{title}</h1><p>{body}</p>"
+        "<p style='color:#666;font-size:90%'>ARGUS &mdash; engineering stall radar</p>",
+        status_code=status_code)
+
+
+async def _verified_slack_body(request: Request) -> bytes:
+    """Read the raw body and refuse anything Slack did not sign.
+
+    Reads the body FIRST and verifies those exact bytes, because the
+    signature covers what was sent, not what a JSON or form parser hands back
+    afterwards. Same trap as the GitHub webhook above, and the reason both
+    handlers take a `Request` instead of a parsed model.
+    """
+    raw = await request.body()
+    ok, reason = slack_app.verify_signature(
+        config.SLACK_SIGNING_SECRET or "", raw,
+        request.headers.get("x-slack-request-timestamp"),
+        request.headers.get("x-slack-signature"))
+    if not ok:
+        with db.unbound_app_tx() as conn:
+            _audit(conn, None, "slack", "slack.request", "denied", reason)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"Slack signature rejected: {reason}")
+    return raw
+
+
+def _record_slack_delivery(conn, tenant_id: str, team_id: str, dedup_key: str,
+                           kind: str, event_type: str | None, at: str,
+                           outcome: str, detail: str | None = None) -> bool:
+    """Insert the delivery ledger row. Returns False if it was already there.
+
+    ON CONFLICT DO NOTHING plus a rowcount check, rather than SELECT-then-
+    INSERT: two of Slack's retries can arrive concurrently, and the unique
+    index is the only thing that actually settles which one wins.
+    """
+    cur = conn.execute(
+        "INSERT INTO slack_event (tenant_id, team_id, dedup_key, kind, event_type,"
+        " received_at, outcome, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"
+        " ON CONFLICT (tenant_id, dedup_key) DO NOTHING",
+        (tenant_id, team_id, dedup_key, kind, event_type, at, outcome, detail))
+    return cur.rowcount == 1
+
+
+def _revoke_slack_workspace(conn, tenant_id: str, integration_id: int,
+                            at: str, reason: str) -> None:
+    """Mark a workspace's install dead on both tables at once.
+
+    `integration.revoked_at` is what stops `argus_resolve_slack_team` treating
+    it as live; `slack_workspace_token.revoked_at` is what frees the workspace
+    to be claimed by another tenant later (the partial unique index only
+    covers live rows). Missing either one leaves a half-uninstalled workspace,
+    which is worse than either state on its own.
+    """
+    conn.execute("UPDATE integration SET revoked_at=%s WHERE id=%s", (at, integration_id))
+    conn.execute(
+        "UPDATE slack_workspace_token SET revoked_at=%s, revoked_reason=%s"
+        " WHERE integration_id=%s AND revoked_at IS NULL", (at, reason, integration_id))
+
+
+@app.post("/v1/admin/tenants/{slug}/slack/install-link", response_model=InstallLinkOut,
+          status_code=201)
+def create_slack_install_link(slug: str, _: Admin) -> InstallLinkOut:
+    """Mints the one-time 'Add ARGUS to Slack' link for one pilot team.
+
+    Identical construction to 7.2's GitHub install link and for the identical
+    reason (D-134): the workspace never gets to say which ARGUS tenant it
+    belongs to. The token decides, it is minted by an admin for one tenant,
+    and it is single-use.
+    """
+    plaintext, token_hash = slack_app.generate_claim_token()
+    created = now_iso()
+    expires_at = datetime.fromtimestamp(
+        time.time() + config.INSTALL_CLAIM_TTL_SECONDS, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with db.admin_tx() as conn:
+            conn.execute("SELECT argus_admin_mint_install_claim(%s,%s,%s,%s,%s)",
+                         (slug, token_hash, created, expires_at, "slack"))
+    except psycopg.errors.RaiseException:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such tenant")
+    if not config.PUBLIC_BASE_URL:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "ARGUS_PUBLIC_BASE_URL is not set on this host")
+    return InstallLinkOut(
+        install_url=f"{config.PUBLIC_BASE_URL}/v1/slack/install?state={plaintext}",
+        token=plaintext, expires_at=expires_at)
+
+
+@app.get("/v1/slack/install")
+def slack_install(state: str):
+    """The link a pilot contact clicks. Checks the claim, then redirects.
+
+    The check is the point. Without it, someone holding a stale link
+    authorises ARGUS inside their real workspace, gets bounced back here, and
+    only then learns the link expired — having already granted permissions
+    for an install that then fails. Checking first means nothing happens in
+    their Slack at all and the page just says 'ask for a fresh link'.
+    """
+    if not (config.SLACK_CLIENT_ID and config.PUBLIC_BASE_URL):
+        return _slack_page("Slack install is not configured yet",
+                           "This ARGUS deployment has no Slack app credentials set. "
+                           "Nothing was sent to Slack.", 503)
+    with db.unbound_app_tx() as conn:
+        tenant_id = conn.execute("SELECT argus_install_claim_tenant(%s,%s,%s) AS t",
+                                 (slack_app.hash_claim_token(state), "slack",
+                                  now_iso())).fetchone()["t"]
+    if tenant_id is None:
+        return _slack_page(
+            "This install link is invalid or has expired",
+            "Install links are single-use and time-limited. Nothing has been changed in "
+            "your Slack workspace &mdash; ask for a fresh link and click that one instead.",
+            400)
+    return RedirectResponse(slack_app.oauth_authorize_url(state), status_code=302)
+
+
+@app.get("/v1/slack/oauth/callback")
+def slack_oauth_callback(code: str | None = None, state: str | None = None,
+                         error: str | None = None):
+    """Slack's redirect back after the workspace approves (or does not).
+
+    The one slack.com call this flow makes runs here, on the deployed host —
+    never in Claude's sandbox, which has no route to slack.com (D-115). Same
+    ordering trick as D-135 used for api.github.com: put the call somewhere
+    that can actually make it, rather than working around where it cannot.
+    """
+    if error:
+        return _slack_page("Install cancelled",
+                           f"Slack reported: <code>{error}</code>. Nothing was connected. "
+                           "You can click your install link again whenever you're ready.", 400)
+    if not code or not state:
+        return _slack_page("Incomplete Slack response",
+                           "Slack's redirect was missing its authorisation code. "
+                           "Please start again from your install link.", 400)
+    if not config.SLACK_TOKEN_KEY:
+        # Refusing here rather than storing a live bot token in the clear.
+        return _slack_page("Slack install is not configured yet",
+                           "This ARGUS deployment cannot store workspace credentials "
+                           "securely yet. Nothing was connected.", 503)
+    try:
+        install = slack_app.exchange_oauth_code(code)
+    except slack_app.SlackError as exc:
+        return _slack_page("Slack refused the install",
+                           f"Slack reported: <code>{exc.error}</code>. Nothing was "
+                           "connected. Ask for a fresh install link and try again.", 400)
+    except slack_app.SlackNotConfigured as exc:
+        return _slack_page("Slack install is not configured yet", str(exc), 503)
+
+    at = now_iso()
+    token_hash = slack_app.hash_claim_token(state)
+
+    # Learn the tenant BEFORE encrypting, because slack_crypto binds the
+    # tenant id into the ciphertext as associated data — a token copied from
+    # one tenant's row into another's then fails to authenticate instead of
+    # decrypting. This peek does not redeem anything; the claim function
+    # below re-checks `redeemed_at IS NULL` atomically, so two callbacks
+    # racing on one token still produce exactly one install.
+    with db.unbound_app_tx() as conn:
+        tenant_id = conn.execute("SELECT argus_install_claim_tenant(%s,%s,%s) AS t",
+                                 (token_hash, "slack", at)).fetchone()["t"]
+    if tenant_id is None:
+        return _slack_page(
+            "This install link is invalid or has expired",
+            "Install links are single-use. Ask for a fresh one &mdash; nothing has been "
+            "connected.", 400)
+    tenant_id = str(tenant_id)
+    ciphertext = slack_crypto.encrypt_token(install.access_token, tenant_id)
+
+    with db.unbound_app_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM argus_claim_slack_workspace(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (token_hash, install.team_id, install.team_name, install.bot_user_id,
+             install.app_id, install.installer_user_id, install.scopes,
+             ciphertext, slack_crypto.KEY_VERSION, at)).fetchone()
+        if row["out_status"] == "bad_claim":
+            return _slack_page(
+                "This install link is invalid or has expired",
+                "Install links are single-use. Ask for a fresh one &mdash; nothing has "
+                "been connected.", 400)
+        if row["out_status"] == "team_taken":
+            return _slack_page(
+                "This Slack workspace is already connected to ARGUS",
+                "A workspace can be connected to one ARGUS team at a time. Remove the "
+                "existing ARGUS app from this workspace first, then use your install "
+                "link again.", 409)
+        _audit(conn, tenant_id, f"slack:{install.team_id}", "slack.install", "ok",
+               install.team_name or install.team_id)
+    return _slack_page(
+        "&#9989; ARGUS is now connected to Slack",
+        f"Workspace <b>{install.team_name or install.team_id}</b> is connected. You can "
+        "close this tab. ARGUS will only ever send direct messages about work it has "
+        "flagged &mdash; it cannot read your channels or your message history.")
+
+
+@app.post("/v1/slack/events")
+async def slack_events(request: Request) -> dict[str, Any]:
+    """Slack's Events API. Signature, then handshake, then route, then dedup.
+
+    Returns 200 for nearly everything on purpose. Slack retries any delivery
+    it does not see a 2xx for, three times, and an event ARGUS legitimately
+    does not care about is not a failure — answering 500 to it just produces
+    three more copies of the same non-event.
+    """
+    raw = await _verified_slack_body(request)
+    try:
+        envelope = json.loads(raw) if raw else {}
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Malformed JSON body")
+
+    # Slack's one-time ownership check when the Request URL is first saved.
+    if envelope.get("type") == "url_verification":
+        return {"challenge": envelope.get("challenge")}
+
+    if envelope.get("type") != "event_callback":
+        return {"status": "ignored", "reason": f"unhandled envelope {envelope.get('type')!r}"}
+
+    team_id = envelope.get("team_id") or ""
+    event = envelope.get("event") or {}
+    event_type = event.get("type") or ""
+    at = now_iso()
+
+    with db.unbound_app_tx() as conn:
+        resolved = conn.execute("SELECT * FROM argus_resolve_slack_team(%s)",
+                                (team_id,)).fetchone()
+    if resolved is None:
+        # Unlike GitHub, this is not a normal waiting state: a workspace
+        # cannot send ARGUS events without having installed it, and installing
+        # requires redeeming a claim. So it is recorded rather than shrugged
+        # at — it means a workspace we have no record of is talking to us.
+        with db.unbound_app_tx() as conn:
+            _audit(conn, None, f"slack:{team_id}", "slack.event", "denied",
+                   f"unknown team, event={event_type}")
+        return {"status": "unresolved", "reason": "no tenant for this Slack workspace"}
+    if resolved["tenant_status"] == "suspended":
+        return {"status": "ignored", "reason": "tenant suspended"}
+
+    tenant_id = str(resolved["tenant_id"])
+    dedup_key = slack_app.event_dedup_key(envelope)
+    with db.tenant_tx(tenant_id) as conn:
+        outcome = "uninstalled" if event_type in slack_app.UNINSTALL_EVENTS else "ignored"
+        if not _record_slack_delivery(conn, tenant_id, team_id, dedup_key, "event",
+                                      event_type, at, outcome):
+            return {"status": "duplicate", "event": event_type}
+        if event_type in slack_app.UNINSTALL_EVENTS:
+            _revoke_slack_workspace(conn, tenant_id, resolved["integration_id"], at,
+                                    event_type)
+            _audit(conn, tenant_id, f"slack:{team_id}", "slack.uninstall", "ok", event_type)
+            return {"status": "ok", "event": event_type, "action": "workspace_revoked"}
+    return {"status": "ok", "event": event_type}
+
+
+@app.post("/v1/slack/interactions")
+async def slack_interactions(request: Request) -> Any:
+    """Every button press and dialog submission from every pilot workspace.
+
+    Slack posts these as `application/x-www-form-urlencoded` with the real
+    payload in a single `payload` field, and signs the raw form body — so the
+    body is verified first and only then parsed, same as the events endpoint.
+
+    Slack also gives this endpoint three seconds before it retries. Everything
+    below is one resolve, one insert and one update, plus at most one call
+    back to Slack (opening the [Blocked on…] dialog, which has to happen
+    inside the window by construction — Slack's `trigger_id` expires).
+    """
+    raw = await _verified_slack_body(request)
+    form = urllib.parse.parse_qs(raw.decode("utf-8"))
+    payload_raw = (form.get("payload") or [""])[0]
+    try:
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Malformed interaction payload")
+
+    team = payload.get("team") or {}
+    team_id = team.get("id") or (payload.get("user") or {}).get("team_id") or ""
+    at = now_iso()
+
+    with db.unbound_app_tx() as conn:
+        resolved = conn.execute("SELECT * FROM argus_resolve_slack_team(%s)",
+                                (team_id,)).fetchone()
+    if resolved is None or resolved["revoked_at"] is not None:
+        with db.unbound_app_tx() as conn:
+            _audit(conn, None, f"slack:{team_id}", "slack.interaction", "denied",
+                   "unknown or revoked workspace")
+        # 200 rather than 4xx: the person clicking is a developer in someone's
+        # Slack, and Slack renders a non-2xx to them as a red error banner.
+        # There is nothing they can do about our routing.
+        return {"status": "unresolved"}
+    if resolved["tenant_status"] == "suspended":
+        return {"status": "ignored", "reason": "tenant suspended"}
+
+    tenant_id = str(resolved["tenant_id"])
+    dedup_key = slack_app.interaction_dedup_key(payload)
+    with db.tenant_tx(tenant_id) as conn:
+        if not _record_slack_delivery(conn, tenant_id, team_id, dedup_key, "interaction",
+                                      payload.get("type"), at, "pending"):
+            return {"status": "duplicate"}
+        transport = slack_app.transport_for(conn, tenant_id, resolved["integration_id"])
+        result = slack_app.handle_interaction(conn, tenant_id, payload, transport, at)
+        conn.execute(
+            "UPDATE slack_event SET outcome=%s, detail=%s WHERE tenant_id=%s AND dedup_key=%s",
+            (result.action, result.reason[:500], tenant_id, dedup_key))
+        if result.handled and result.action == "response_recorded":
+            _audit(conn, tenant_id, f"slack:{team_id}", "slack.triage_response", "ok",
+                   f"{result.response_type} on triage_message {result.triage_message_id}")
+    # A view_submission validation error has to come back as Slack's own
+    # response_action shape or the dialog silently closes on an empty answer.
+    return result.response_body if result.response_body is not None else {}
