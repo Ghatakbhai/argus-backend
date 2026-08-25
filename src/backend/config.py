@@ -144,3 +144,10 @@ INGEST_POLL_INTERVAL_SECONDS = float(
 # format knowledge — and the same consequence of losing it: every pilot's
 # Jira credentials would need re-entering, nothing else is compromised.
 JIRA_CREDENTIAL_KEY = os.environ.get("ARGUS_JIRA_CREDENTIAL_KEY")
+
+# --- Phase 7.4c-e: Linear credential storage (§3.1.4) -----------------------
+# Same reasoning as JIRA_CREDENTIAL_KEY immediately above, and deliberately
+# its own separate key rather than reused — see linear_crypto.py's module
+# docstring for why this session chose not to share ARGUS_JIRA_CREDENTIAL_KEY
+# despite jira_crypto.py's own docstring floating that as an option.
+LINEAR_CREDENTIAL_KEY = os.environ.get("ARGUS_LINEAR_CREDENTIAL_KEY")
