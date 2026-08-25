@@ -17,6 +17,8 @@ installation to exactly one tenant before any of its data is ever touched.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import time
 import urllib.parse
@@ -29,7 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, github_app, slack_app, slack_crypto
+from . import config, db, github_app, ingest_worker, slack_app, slack_crypto
 from .auth import TenantContext, generate_key, hash_key, now_iso
 
 
@@ -82,6 +84,10 @@ class AlertOut(BaseModel):
     ticket_id: int | None
     decided_at: str
     feedback: str | None = None
+    item_key: str | None = None
+    title: str | None = None
+    url: str | None = None
+    detail: str | None = None
 
 
 class FeedbackIn(BaseModel):
@@ -103,6 +109,7 @@ class DigestOut(BaseModel):
     status: str
     rendered_text: str
     delivered_at: str
+    payload_json: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -186,18 +193,25 @@ async def lifespan(app: FastAPI):
     # it at all yet. This makes that a non-event instead of a manual `psql
     # -f schema_pg.sql` step nobody is supposed to have to run.
     db.bootstrap_schema_if_needed()
+    poller_task = None
+    if config.INGEST_POLLER_ENABLED:
+        poller_task = asyncio.create_task(ingest_worker.poll_forever())
     yield
+    if poller_task is not None:
+        poller_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poller_task
     db.close_pools()
 
 
-app = FastAPI(title="ARGUS", version="7.3", lifespan=lifespan)
+app = FastAPI(title="ARGUS", version="7.4c", lifespan=lifespan)
 
 
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
     with db.unbound_app_tx() as conn:
         conn.execute("SELECT 1")
-    return {"status": "ok", "phase": "7.3"}
+    return {"status": "ok", "phase": "7.4c"}
 
 
 # --- control plane ---------------------------------------------------------
@@ -268,14 +282,43 @@ def pilot_metrics(_: Admin) -> list[dict[str, Any]]:
         return conn.execute("SELECT * FROM argus_pilot_metrics()").fetchall()
 
 
+@app.post("/v1/admin/tenants/{slug}/ingest/run-now", status_code=201)
+def run_ingest_now(slug: str, _: Admin) -> dict[str, Any]:
+    """7.4c-c: manual trigger for an ingest run. Runs synchronously and returns
+    the result. Inserts row directly as 'running' so poller won't double-claim it."""
+    with db.admin_tx() as conn:
+        tenant = conn.execute("SELECT id, slug FROM tenant WHERE slug=%s", (slug,)).fetchone()
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such tenant")
+    tid = str(tenant["id"])
+    at = now_iso()
+    with db.tenant_tx(tid) as conn:
+        run = conn.execute(
+            "INSERT INTO ingest_run (tenant_id, trigger_kind, status, started_at)"
+            " VALUES (%s,'manual','running',%s) RETURNING id",
+            (tid, at),
+        ).fetchone()
+        _audit(conn, tid, "admin", "ingest.run_now", "ok", f"run_id={run['id']}")
+    res = ingest_worker.run_one(tid, tenant["slug"], run["id"])
+    return {
+        "status": res["status"],
+        "ingest_run_id": run["id"],
+        "detail": res.get("detail", {}),
+    }
+
+
 # --- tenant surface --------------------------------------------------------
 
 @app.get("/v1/me")
 def whoami(t: Tenant) -> dict[str, Any]:
     with db.tenant_tx(t.tenant_id) as conn:
         rows = conn.execute("SELECT slug, display_name, status FROM tenant").fetchall()
+        members = conn.execute(
+            "SELECT id, full_name, email, is_active FROM person WHERE is_active=true ORDER BY id"
+        ).fetchall()
     return {"tenant": rows[0] if rows else None, "visible_tenant_rows": len(rows),
-            "shadow_mode": not t.may_send_dms, "shadow_until": t.shadow_until}
+            "shadow_mode": not t.may_send_dms, "shadow_until": t.shadow_until,
+            "members": [dict(m) for m in members]}
 
 
 @app.post("/v1/ingest/runs", response_model=IngestRunOut, status_code=201)
@@ -306,8 +349,11 @@ def list_alerts(
     outcome: Annotated[Literal["FIRE", "SUPPRESSED", "ABSTAIN"] | None, Query()] = None,
     limit: int = 100,
 ) -> list[AlertOut]:
-    sql = ("SELECT a.*, f.verdict AS feedback FROM alert a"
-           " LEFT JOIN alert_feedback f ON f.alert_id = a.id")
+    sql = ("SELECT a.*, f.verdict AS feedback,"
+           " w.item_key, w.title, w.url, a.detail"
+           " FROM alert a"
+           " LEFT JOIN alert_feedback f ON f.alert_id = a.id"
+           " LEFT JOIN work_item w ON w.id = a.work_item_id")
     params: list[Any] = []
     if outcome:
         sql += " WHERE a.outcome = %s"
@@ -316,7 +362,7 @@ def list_alerts(
     params.append(limit)
     with db.tenant_tx(t.tenant_id) as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [AlertOut(**{k: r[k] for k in AlertOut.model_fields}) for r in rows]
+    return [AlertOut(**{k: r[k] for k in AlertOut.model_fields if k in r}) for r in rows]
 
 
 @app.post("/v1/alerts/feedback", status_code=201)
@@ -346,18 +392,25 @@ def list_digests(t: Tenant, limit: int = 14) -> list[DigestOut]:
             "SELECT * FROM digest_delivery ORDER BY delivered_at DESC, id DESC LIMIT %s",
             (limit,),
         ).fetchall()
-    return [DigestOut(**{k: r[k] for k in DigestOut.model_fields}) for r in rows]
+    return [DigestOut(**{k: r[k] for k in DigestOut.model_fields if k in r}) for r in rows]
 
 
-@app.get("/v1/digests/latest", response_model=DigestOut)
-def latest_digest(t: Tenant) -> DigestOut:
+@app.get("/v1/digests/latest")
+def latest_digest(
+    t: Tenant,
+    format: Annotated[Literal["text", "json"] | None, Query()] = None,
+) -> Any:
     with db.tenant_tx(t.tenant_id) as conn:
         row = conn.execute(
             "SELECT * FROM digest_delivery ORDER BY delivered_at DESC, id DESC LIMIT 1"
         ).fetchone()
     if row is None:
         raise HTTPException(404, "No digest yet")
-    return DigestOut(**{k: row[k] for k in DigestOut.model_fields})
+    if format == "json":
+        if not row.get("payload_json"):
+            raise HTTPException(409, "Digest has no structured payload")
+        return json.loads(row["payload_json"])
+    return DigestOut(**{k: row[k] for k in DigestOut.model_fields if k in row})
 
 
 # ============================================================================
