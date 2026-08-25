@@ -38,26 +38,39 @@ as it did before this step (zero Jira projects, `record_phase6_run`'s own
 ticket-link resolution — see that function's docstring — is a guaranteed
 no-op with zero tickets in the index). GitHub remains the one integration
 `run_one` requires; `NoGitHubInstallation` is unchanged.
+
+**7.4c-e (Linear live ingestion):** `run_one` now also fetches every Linear
+team the tenant has live (unrevoked) credentials for — decrypted via the
+new `backend.linear_crypto` — and ingests each through the new
+`linear_live_ingest.ingest_linear_team`, into the SAME scratch DB
+GitHub's/Jira's data already landed in. Optional per tenant, exactly like
+Jira: zero Linear teams configured is a guaranteed no-op, not a failure. A
+tenant can have Jira, Linear, both, or neither connected — every
+combination runs through the same one `ticket`/`ticket_status_event`
+index and the same unmodified `sprint_filter.sprint_gate()`, since both
+adapters were built from the start to write into the same source-agnostic
+tables (D-006).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 
-from . import config, db, github_app, jira_crypto, migrate_sqlite
+from . import config, db, github_app, jira_crypto, linear_crypto, migrate_sqlite
 from .auth import now_iso
 
-# `github_live_ingest`/`jira_live_ingest` and the frozen Phase 6 engine they
-# call into (`digest`/`sprint_filter`) live one directory up, in src/ — the
-# same layout every other backend module that reaches into src/ relies on.
-# `migrate_sqlite` (imported above) already puts that directory on
-# `sys.path` as a side effect of its own module-level `from . import
-# dashboard_payload` (see dashboard_payload.py's docstring); importing it
-# before this module's own `import github_live_ingest`/`jira_live_ingest`
-# below is what makes those imports resolve regardless of which module a
-# caller imports first.
+# `github_live_ingest`/`jira_live_ingest`/`linear_live_ingest` and the frozen
+# Phase 6 engine they call into (`digest`/`sprint_filter`) live one directory
+# up, in src/ — the same layout every other backend module that reaches into
+# src/ relies on. `migrate_sqlite` (imported above) already puts that
+# directory on `sys.path` as a side effect of its own module-level `from .
+# import dashboard_payload` (see dashboard_payload.py's docstring); importing
+# it before this module's own `import github_live_ingest`/`jira_live_ingest`/
+# `linear_live_ingest` below is what makes those imports resolve regardless
+# of which module a caller imports first.
 import github_live_ingest as GLI  # noqa: E402
 import jira_live_ingest as JLI  # noqa: E402
+import linear_live_ingest as LLI  # noqa: E402
 
 logger = logging.getLogger("argus.ingest_worker")
 
@@ -130,6 +143,36 @@ def _jira_projects(conn, tenant_id: str) -> list[dict]:
     return projects
 
 
+def _linear_teams(conn, tenant_id: str) -> list[dict]:
+    """Every live (unrevoked) Linear integration this tenant has configured
+    via `POST /v1/admin/tenants/{slug}/linear/credentials` — mirrors
+    `_jira_projects` above exactly, one difference: Linear's credential is
+    a single API key (no email pair) and there is no per-tenant base_url to
+    read back (`display_name` still holds it, `linear_crypto.py`'s module
+    docstring explains why — always `https://api.linear.app` today, kept
+    in the row for the same "an admin can see what this connects to
+    without decrypting anything" reason Jira's does).
+    """
+    rows = conn.execute(
+        "SELECT i.id, i.external_account_id, i.display_name, i.credential_ref"
+        " FROM integration i"
+        " JOIN source s ON s.id = i.source_id AND s.tenant_id = i.tenant_id"
+        " WHERE s.name = 'linear' AND i.revoked_at IS NULL"
+        " ORDER BY i.installed_at"
+    ).fetchall()
+    teams = []
+    for row in rows:
+        try:
+            creds = linear_crypto.decrypt_credential(row["credential_ref"], tenant_id)
+        except linear_crypto.LinearCredentialUndecryptable as e:
+            teams.append({"team_key": row["external_account_id"],
+                         "base_url": row["display_name"], "error": str(e)})
+            continue
+        teams.append({"team_key": row["external_account_id"],
+                     "base_url": row["display_name"], "api_key": creds["api_key"]})
+    return teams
+
+
 def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
     """Runs §3.1.2 steps 2-6 to completion for one already-'running'
     `ingest_run` row, and always leaves that row in a terminal state
@@ -147,6 +190,7 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         with db.tenant_tx(tenant_id) as conn:
             installation_id = _github_installation_id(conn, tenant_id)
             jira_projects = _jira_projects(conn, tenant_id)
+            linear_teams = _linear_teams(conn, tenant_id)
         if installation_id is None:
             raise NoGitHubInstallation(
                 f"tenant {tenant_slug!r} has no active (unrevoked) GitHub installation")
@@ -156,6 +200,9 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         jira_errors: dict[str, str] = {}
         jira_projects_ingested = 0
         jira_tickets_ingested = 0
+        linear_errors: dict[str, str] = {}
+        linear_teams_ingested = 0
+        linear_tickets_ingested = 0
         sconn = GLI.build_scratch_db()
         try:
             summary = GLI.ingest_installation(sconn, token, at)
@@ -177,6 +224,19 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
                 jira_projects_ingested += 1
                 jira_tickets_ingested += jira_summary.tickets
 
+            for team in linear_teams:
+                key = team["team_key"]
+                if "error" in team:
+                    linear_errors[key] = team["error"]
+                    continue
+                linear_summary = LLI.ingest_linear_team(
+                    sconn, key, team["api_key"], at, team["base_url"])
+                if linear_summary.error is not None:
+                    linear_errors[key] = linear_summary.error
+                    continue
+                linear_teams_ingested += 1
+                linear_tickets_ingested += linear_summary.tickets
+
             migrated = migrate_sqlite.migrate(sconn, tenant_slug)
             result = migrate_sqlite.record_phase6_run(
                 sconn, tenant_slug, migrated["idmap"]["work_item"],
@@ -184,16 +244,18 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         finally:
             sconn.close()
 
-        if summary.repo_errors or jira_errors:
-            # A repo- or Jira-project-level failure is not a run-level
-            # failure (7.4c-b's isolation guarantee: "one repo's bad night
-            # must never wedge the poller for the other fourteen", extended
-            # here to Jira projects) — the run still succeeded for every
-            # integration that DID work. But it is worth recording, not
-            # silently dropped just because it didn't reach the severity of
-            # failing the whole run.
+        if summary.repo_errors or jira_errors or linear_errors:
+            # A repo-, Jira-project-, or Linear-team-level failure is not a
+            # run-level failure (7.4c-b's isolation guarantee: "one repo's
+            # bad night must never wedge the poller for the other
+            # fourteen", extended here to Jira projects and Linear teams
+            # alike) — the run still succeeded for every integration that
+            # DID work. But it is worth recording, not silently dropped
+            # just because it didn't reach the severity of failing the
+            # whole run.
             parts = [f"{repo}: {err}" for repo, err in summary.repo_errors.items()]
             parts += [f"jira:{key}: {err}" for key, err in jira_errors.items()]
+            parts += [f"linear:{key}: {err}" for key, err in linear_errors.items()]
             detail = "; ".join(parts)
             with db.tenant_tx(tenant_id) as conn:
                 conn.execute("UPDATE ingest_run SET error_detail=%s WHERE id=%s",
@@ -209,6 +271,10 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
             "jira_projects_ingested": jira_projects_ingested,
             "jira_tickets_ingested": jira_tickets_ingested,
             "jira_projects_failed": len(jira_errors),
+            "linear_teams_seen": len(linear_teams),
+            "linear_teams_ingested": linear_teams_ingested,
+            "linear_tickets_ingested": linear_tickets_ingested,
+            "linear_teams_failed": len(linear_errors),
             "FIRE": result["FIRE"], "SUPPRESSED": result["SUPPRESSED"],
             "ABSTAIN": result["ABSTAIN"],
         }
