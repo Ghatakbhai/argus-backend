@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, github_app, ingest_worker, slack_app, slack_crypto
+from . import config, db, github_app, ingest_worker, jira_crypto, slack_app, slack_crypto
 from .auth import TenantContext, generate_key, hash_key, now_iso
 
 
@@ -100,6 +100,28 @@ class InstallLinkOut(BaseModel):
     install_url: str
     token: str = Field(description="Shown once; also embedded in install_url.")
     expires_at: str
+
+
+class JiraCredentialsIn(BaseModel):
+    """7.4c-d/§3.1.4: Jira has no App-install flow like GitHub/Slack, so an
+    ARGUS admin enters a pilot's credentials by hand during onboarding
+    (docs/PHASE7_5_OPERATIONAL_CHECKLIST.md §5). `base_url` and
+    `project_key` are not secret (stored in the clear on `integration`);
+    `email`/`api_token` are the real credential and are encrypted at rest
+    via `jira_crypto` before they ever reach the database — see that
+    module's docstring."""
+    base_url: str = Field(description="e.g. https://acme.atlassian.net")
+    project_key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9]{1,9}$",
+                             description="Jira project key, e.g. ENG")
+    email: str
+    api_token: str
+
+
+class JiraCredentialsOut(BaseModel):
+    integration_id: int
+    project_key: str
+    base_url: str
+    installed_at: str
 
 
 class DigestOut(BaseModel):
@@ -303,8 +325,69 @@ def run_ingest_now(slug: str, _: Admin) -> dict[str, Any]:
     return {
         "status": res["status"],
         "ingest_run_id": run["id"],
-        "detail": res.get("detail", {}),
+        # A real, pre-existing bug found and fixed while testing 7.4c-d, not
+        # this step's own change: `run_one` has always returned a FLAT dict
+        # (`status`, `work_items_ingested`, ...), never one nested under a
+        # `"detail"` key — so `res.get("detail", {})` silently discarded
+        # every field the response was supposed to carry, on every call,
+        # since 7.4c-c shipped it. `test_run_now_runs_synchronously_and_
+        # returns_the_real_outcome` already asserted the correct shape
+        # (`body["detail"]["work_items_ingested"]`); nothing in app.py ever
+        # matched it. Caught establishing this session's test baseline, not
+        # assumed correct because the endpoint returned 201.
+        "detail": {k: v for k, v in res.items() if k not in ("status", "run_id")},
     }
+
+
+@app.post("/v1/admin/tenants/{slug}/jira/credentials", response_model=JiraCredentialsOut,
+         status_code=201)
+def set_jira_credentials(slug: str, body: JiraCredentialsIn, _: Admin) -> JiraCredentialsOut:
+    """7.4c-d/§3.1.4: an ARGUS admin (Claude, during onboarding) configures
+    one Jira project's live credentials for a tenant. No install flow to
+    redirect through — this endpoint IS the install, same operational
+    shape as Blocker 2's hand-entered Slack app secrets.
+
+    Idempotent per (tenant, project): calling again for the same
+    `project_key` updates that integration's credential in place (a
+    rotated API token, a corrected email) rather than creating a second
+    row — `integration`'s own UNIQUE (tenant_id, source_id,
+    external_account_id) already enforces this is the right key.
+    """
+    if not config.JIRA_CREDENTIAL_KEY:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "ARGUS_JIRA_CREDENTIAL_KEY is not configured on this host — "
+                            "refusing to store a Jira credential in the clear.")
+    with db.admin_tx() as conn:
+        tenant = conn.execute("SELECT id FROM tenant WHERE slug=%s", (slug,)).fetchone()
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such tenant")
+    tid = str(tenant["id"])
+    at = now_iso()
+    ciphertext = jira_crypto.encrypt_credential(body.email, body.api_token, tid)
+    with db.tenant_tx(tid) as conn:
+        source = conn.execute("SELECT id FROM source WHERE name='jira'").fetchone()
+        if source is None:
+            # Every tenant is seeded with a 'jira' source row at creation
+            # (argus_seed_tenant_sources, roles.sql) — reaching here would
+            # mean that seeding itself regressed, not a normal runtime state.
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                "tenant has no 'jira' source row — seeding regression")
+        row = conn.execute(
+            """INSERT INTO integration (tenant_id, source_id, external_account_id,
+                                        display_name, scope, credential_ref, installed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (tenant_id, source_id, external_account_id)
+               DO UPDATE SET display_name=EXCLUDED.display_name,
+                             credential_ref=EXCLUDED.credential_ref,
+                             installed_at=EXCLUDED.installed_at,
+                             revoked_at=NULL
+               RETURNING id, installed_at""",
+            (tid, source["id"], body.project_key, body.base_url, "project",
+             ciphertext, at),
+        ).fetchone()
+        _audit(conn, tid, "admin", "jira.credentials", "ok", body.project_key)
+    return JiraCredentialsOut(integration_id=row["id"], project_key=body.project_key,
+                              base_url=body.base_url, installed_at=row["installed_at"])
 
 
 # --- tenant surface --------------------------------------------------------
