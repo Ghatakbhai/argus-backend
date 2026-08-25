@@ -1,6 +1,6 @@
 """Load a Phase 6 SQLite database into one tenant of the Phase 7 Postgres.
 
-Two jobs, and the second is the interesting one:
+Three jobs now — the third added at Phase 7.4b:
 
   1. Copy the entity model across, remapping every integer id. Ids in SQLite
      are per-file; ids in Postgres are global across all pilot teams, so a
@@ -14,17 +14,58 @@ Two jobs, and the second is the interesting one:
      (a NULL pattern, a 'P2-shaped' pattern, a reason string nobody enumerated),
      rather than a tidied-up version of it.
 
+  3. Run `digest.collect` over the SAME results and store a real
+     `digest_delivery` row — `rendered_text` (the HTML report) and
+     `payload_json` (`dashboard_payload.build_dashboard_payload`'s envelope),
+     from the same `Digest`, so the two can never disagree. This is what
+     `src/dashboard/CONTRACT.md` named as owed and closes it for every tenant
+     this function has ever been used to seed — see D-155 in
+     `context/DECISIONS.md` for what this does and does not prove about a
+     REAL pilot team's live data (nothing yet — see that decision).
+
+**7.4c-a (D-156's build, step a of f):** `migrate()` and `record_phase6_run()`
+now accept EITHER a path to a SQLite file on disk (original behavior,
+unchanged: opened read-only here, closed here) OR an already-open
+`sqlite3.Connection` (new: the caller opened it — typically an in-memory
+scratch database it just populated from a live GitHub/Jira/Linear fetch —
+and keeps owning its lifecycle; this module never closes a connection it did
+not open). This is the one piece of plumbing the live ingestion consumer
+(D-156) needs from this module: build a fresh scratch DB, populate it live,
+then hand the same open connection to both functions below — no temp file
+ever touches disk. Nothing about the file-path path changed; see D-160.
+
 Usage:
     python -m backend.migrate_sqlite <sqlite-path> <tenant-slug>
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
-from pathlib import Path
 
-from . import db
+from . import dashboard_payload, db
 from .auth import now_iso
+
+
+def _open_source(source: str | sqlite3.Connection) -> tuple[sqlite3.Connection, bool]:
+    """Normalizes `migrate()`/`record_phase6_run()`'s first argument.
+
+    `source` is either a path to a SQLite file — opened read-only here, same
+    as always — or an already-open `sqlite3.Connection`, which is used as-is.
+    Returns `(connection, owns_it)`: `owns_it` is True only when THIS
+    function opened the connection, so the caller (`migrate`/
+    `record_phase6_run`) closes only what it opened. A connection handed in
+    by our caller is theirs to close, not ours — closing someone else's
+    in-memory scratch DB out from under them would be a real bug the moment
+    the live ingestion consumer starts reusing one connection across both
+    `migrate()` and `record_phase6_run()` in the same run (D-156).
+    """
+    if isinstance(source, sqlite3.Connection):
+        source.row_factory = sqlite3.Row
+        return source, False
+    conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn, True
 
 # (table, {column: table-it-points-at}). Order is dependency order: a table
 # never appears before something it references.
@@ -80,9 +121,8 @@ def sqlite_tables(sconn: sqlite3.Connection) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def migrate(sqlite_path: str, tenant_slug: str) -> dict:
-    sconn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-    sconn.row_factory = sqlite3.Row
+def migrate(sqlite_source: str | sqlite3.Connection, tenant_slug: str) -> dict:
+    sconn, owns_sconn = _open_source(sqlite_source)
     present = sqlite_tables(sconn)
 
     with db.admin_tx() as conn:
@@ -147,38 +187,101 @@ def migrate(sqlite_path: str, tenant_slug: str) -> dict:
                     idmap[table][src[pk]] = new_id
                 n += 1
             counts[table] = n
-    sconn.close()
+    if owns_sconn:
+        sconn.close()
     return {"tenant_id": tenant_id, "counts": counts, "idmap": idmap}
 
 
-def record_phase6_run(sqlite_path: str, tenant_slug: str, work_item_map: dict[int, int]
-                      ) -> dict[str, int]:
-    """Run Phase 6's own filter over the source file and store its verdicts."""
-    sys.path.insert(0, str(Path(sqlite_path).resolve().parent.parent / "src"))
-    import sprint_filter  # noqa: E402  — Phase 6's code, unmodified
+def record_phase6_run(sqlite_source: str | sqlite3.Connection, tenant_slug: str,
+                      work_item_map: dict[int, int], *,
+                      existing_run_id: int | None = None) -> dict[str, int]:
+    """Run Phase 6's own filter over the source data and store its verdicts —
+    and, since Phase 7.4b, a real `digest_delivery` row assembled from the
+    SAME results, so `alert` and the digest can never disagree.
 
-    sconn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
-    sconn.row_factory = sqlite3.Row
+    `sconn` (the SQLite connection) stays open through the digest build, not
+    just the filter run: `dashboard_payload.build_dashboard_payload` and
+    `digest.collect` both read `event`/`presence`/`triage_message`/
+    `readiness` off it, the same tables the filter itself reads. It is only
+    closed here if this function is the one that opened it (`sqlite_source`
+    was a path) — see `_open_source()` and D-160.
+
+    **7.4c-c (D-162's build, step c of f):** `existing_run_id`, new and
+    optional. Every caller before the live ingestion poller wanted a NEW
+    `ingest_run` row (a one-off backfill against a file someone handed us —
+    the original, still-default behavior, unchanged: INSERT, trigger_kind
+    'backfill', status 'succeeded'). The poller is different: a real
+    `ingest_run` row already exists for the run it is finishing — created
+    'queued' by the GitHub webhook handler or the admin run-now endpoint,
+    then flipped to 'running' at claim time (`argus_claim_next_queued_run` /
+    the run-now endpoint itself) — and inserting a second row here would
+    silently duplicate it, leaving the original stuck at 'running' forever
+    and every `alert`/`digest_delivery` row pointing at the wrong run.
+    Passing `existing_run_id` makes this function UPDATE that row in place
+    instead of inserting a new one; every other caller is completely
+    unaffected; see D-162.
+    """
+    # `digest`/`sprint_filter` live in src/, one directory above src/backend/.
+    # `dashboard_payload` (imported at module level, above) already put that
+    # directory on sys.path when IT was first imported — its own docstring
+    # notes this is computed from its own file location, not from anything
+    # path-shaped about our caller's arguments, which is exactly why this can
+    # stay a plain import even when `sqlite_source` is a connection with no
+    # path behind it at all.
+    import digest  # noqa: E402  — Phase 6's code, unmodified
+    import sprint_filter  # noqa: E402
+
+    sconn, owns_sconn = _open_source(sqlite_source)
     results = sprint_filter.run_pipeline(sconn)
     summary = sprint_filter.summarise(results)
-    sconn.close()
 
     with db.admin_tx() as conn:
-        tenant_id = str(conn.execute("SELECT id FROM tenant WHERE slug=%s",
-                                     (tenant_slug,)).fetchone()["id"])
+        trow = conn.execute("SELECT id, display_name FROM tenant WHERE slug=%s",
+                            (tenant_slug,)).fetchone()
+        tenant_id, team_label = str(trow["id"]), trow["display_name"]
+
+    now = now_iso()
+    member_count = sconn.execute(
+        "SELECT COUNT(DISTINCT id) FROM actor WHERE kind='human'").fetchone()[0]
+    dig = digest.collect(sconn, results, now, team_label=team_label or tenant_slug)
+    rendered_text = digest.render_html(dig)
+    payload = dashboard_payload.build_dashboard_payload(
+        sconn, results, now, tenant_slug=tenant_slug, team_label=team_label or tenant_slug,
+        tenant_members=member_count, dig=dig,
+    )
+    if owns_sconn:
+        sconn.close()
+
     with db.tenant_tx(tenant_id) as pg:
-        run_id = pg.execute(
-            "INSERT INTO ingest_run (tenant_id, trigger_kind, status, started_at,"
-            " finished_at, items_checked, alerts_fired, alerts_suppressed)"
-            " VALUES (%s,'backfill','succeeded',%s,%s,%s,%s,%s) RETURNING id",
-            (tenant_id, now_iso(), now_iso(), len(results),
-             summary.get("FIRE", 0), summary.get("SUPPRESSED", 0))).fetchone()["id"]
+        if existing_run_id is None:
+            run_id = pg.execute(
+                "INSERT INTO ingest_run (tenant_id, trigger_kind, status, started_at,"
+                " finished_at, items_checked, alerts_fired, alerts_suppressed)"
+                " VALUES (%s,'backfill','succeeded',%s,%s,%s,%s,%s) RETURNING id",
+                (tenant_id, now, now, len(results),
+                 summary.get("FIRE", 0), summary.get("SUPPRESSED", 0))).fetchone()["id"]
+        else:
+            updated = pg.execute(
+                "UPDATE ingest_run SET status='succeeded', finished_at=%s,"
+                " items_checked=%s, alerts_fired=%s, alerts_suppressed=%s"
+                " WHERE id=%s RETURNING id",
+                (now, len(results), summary.get("FIRE", 0), summary.get("SUPPRESSED", 0),
+                 existing_run_id)).fetchone()
+            if updated is None:
+                raise ValueError(
+                    f"no ingest_run {existing_run_id!r} for tenant {tenant_slug!r} to update"
+                    " — existing_run_id must name a row already belonging to this tenant")
+            run_id = updated["id"]
         for r in results:
             pg.execute(
                 "INSERT INTO alert (tenant_id, ingest_run_id, work_item_id, pattern,"
-                " outcome, reason, decided_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                " outcome, reason, detail, decided_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (tenant_id, run_id, work_item_map.get(r.work_item_id), r.pattern,
-                 r.outcome, r.reason, now_iso()))
+                 r.outcome, r.reason, r.evidence, now))
+        pg.execute(
+            "INSERT INTO digest_delivery (tenant_id, ingest_run_id, channel, status,"
+            " rendered_text, payload_json, delivered_at) VALUES (%s,%s,'dashboard','shadow',%s,%s,%s)",
+            (tenant_id, run_id, rendered_text, json.dumps(payload), now))
     return {"ingest_run_id": run_id, "results": len(results),
             "FIRE": summary.get("FIRE", 0), "SUPPRESSED": summary.get("SUPPRESSED", 0),
             "ABSTAIN": summary.get("ABSTAIN", 0)}
