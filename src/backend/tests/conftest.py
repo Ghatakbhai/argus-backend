@@ -44,6 +44,12 @@ os.environ.setdefault("ARGUS_PUBLIC_BASE_URL", "https://argus-test.example.com")
 # Phase 7.4c-d: Jira credential encryption, same read-at-import-time rule.
 os.environ.setdefault("ARGUS_JIRA_CREDENTIAL_KEY", "test-jira-credential-key-any-string-works")
 
+# Phase 7.4c-e: Linear credential encryption, same read-at-import-time rule.
+# Deliberately a DIFFERENT string from the Jira key above — see
+# linear_crypto.py's module docstring for why this is its own key, not a
+# reuse of ARGUS_JIRA_CREDENTIAL_KEY.
+os.environ.setdefault("ARGUS_LINEAR_CREDENTIAL_KEY", "test-linear-credential-key-any-string-works")
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 from backend import config, db  # noqa: E402
