@@ -26,24 +26,38 @@ shape `migrate_sqlite`/`github_live_ingest` already are). The poller runs it
 via `asyncio.to_thread` so it never blocks the event loop other requests
 share; the run-now endpoint gets this for free because FastAPI already runs a
 sync `def` endpoint in its own worker thread.
+
+**7.4c-d (Jira live ingestion):** `run_one` now also fetches every Jira
+project the tenant has live (unrevoked) credentials for — decrypted via
+`backend.jira_crypto` — and ingests each through the new
+`jira_live_ingest.ingest_jira_project`, into the SAME scratch DB GitHub's
+data already landed in, before `migrate_sqlite.migrate`/`.record_phase6_run`
+carry the whole thing into Postgres. Unlike GitHub, Jira is optional per
+tenant: a tenant with no Jira credentials configured yet still runs exactly
+as it did before this step (zero Jira projects, `record_phase6_run`'s own
+ticket-link resolution — see that function's docstring — is a guaranteed
+no-op with zero tickets in the index). GitHub remains the one integration
+`run_one` requires; `NoGitHubInstallation` is unchanged.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 
-from . import config, db, github_app, migrate_sqlite
+from . import config, db, github_app, jira_crypto, migrate_sqlite
 from .auth import now_iso
 
-# `github_live_ingest` and the frozen Phase 6 engine it calls into
-# (`digest`/`sprint_filter`) live one directory up, in src/ — the same layout
-# every other backend module that reaches into src/ relies on.
+# `github_live_ingest`/`jira_live_ingest` and the frozen Phase 6 engine they
+# call into (`digest`/`sprint_filter`) live one directory up, in src/ — the
+# same layout every other backend module that reaches into src/ relies on.
 # `migrate_sqlite` (imported above) already puts that directory on
 # `sys.path` as a side effect of its own module-level `from . import
 # dashboard_payload` (see dashboard_payload.py's docstring); importing it
-# before this module's own `import github_live_ingest` below is what makes
-# that import resolve regardless of which module a caller imports first.
+# before this module's own `import github_live_ingest`/`jira_live_ingest`
+# below is what makes those imports resolve regardless of which module a
+# caller imports first.
 import github_live_ingest as GLI  # noqa: E402
+import jira_live_ingest as JLI  # noqa: E402
 
 logger = logging.getLogger("argus.ingest_worker")
 
@@ -78,6 +92,44 @@ def _github_installation_id(conn, tenant_id: str) -> str | None:
     return row["external_account_id"] if row else None
 
 
+def _jira_projects(conn, tenant_id: str) -> list[dict]:
+    """Every live (unrevoked) Jira integration this tenant has configured
+    via `POST /v1/admin/tenants/{slug}/jira/credentials` — `base_url`/
+    `project_key` in the clear (`display_name`/`external_account_id`, same
+    columns GitHub's own integration row uses for its account login/
+    installation id), `email`/`api_token` decrypted from `credential_ref`
+    here, once, rather than by each caller. A tenant can have more than one
+    Jira project configured (e.g. two teams' boards); every one of them is
+    ingested into the same scratch DB, same as GitHub's multi-repo walk.
+
+    A single integration whose ciphertext fails to decrypt (wrong key,
+    tampered row, or a credential written under a since-rotated
+    ARGUS_JIRA_CREDENTIAL_KEY) is skipped and recorded, not fatal to the
+    other integrations or to GitHub's own ingestion — the same isolation
+    rule `github_live_ingest.py`'s per-repo try/except and this module's
+    per-project loop (below) both hold themselves to.
+    """
+    rows = conn.execute(
+        "SELECT i.id, i.external_account_id, i.display_name, i.credential_ref"
+        " FROM integration i"
+        " JOIN source s ON s.id = i.source_id AND s.tenant_id = i.tenant_id"
+        " WHERE s.name = 'jira' AND i.revoked_at IS NULL"
+        " ORDER BY i.installed_at"
+    ).fetchall()
+    projects = []
+    for row in rows:
+        try:
+            creds = jira_crypto.decrypt_credential(row["credential_ref"], tenant_id)
+        except jira_crypto.JiraCredentialUndecryptable as e:
+            projects.append({"project_key": row["external_account_id"],
+                             "base_url": row["display_name"], "error": str(e)})
+            continue
+        projects.append({"project_key": row["external_account_id"],
+                         "base_url": row["display_name"],
+                         "email": creds["email"], "api_token": creds["api_token"]})
+    return projects
+
+
 def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
     """Runs §3.1.2 steps 2-6 to completion for one already-'running'
     `ingest_run` row, and always leaves that row in a terminal state
@@ -94,15 +146,37 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
     try:
         with db.tenant_tx(tenant_id) as conn:
             installation_id = _github_installation_id(conn, tenant_id)
+            jira_projects = _jira_projects(conn, tenant_id)
         if installation_id is None:
             raise NoGitHubInstallation(
                 f"tenant {tenant_slug!r} has no active (unrevoked) GitHub installation")
 
         token = _TOKEN_CACHE.get(installation_id)
 
+        jira_errors: dict[str, str] = {}
+        jira_projects_ingested = 0
+        jira_tickets_ingested = 0
         sconn = GLI.build_scratch_db()
         try:
             summary = GLI.ingest_installation(sconn, token, at)
+
+            for proj in jira_projects:
+                key = proj["project_key"]
+                if "error" in proj:
+                    # Credential itself couldn't be decrypted — never
+                    # reaches the network. Recorded the same as a fetch
+                    # failure below: this project's data is missing this
+                    # run, GitHub's (and every other Jira project's) is not.
+                    jira_errors[key] = proj["error"]
+                    continue
+                jira_summary = JLI.ingest_jira_project(
+                    sconn, proj["base_url"], key, proj["email"], proj["api_token"], at)
+                if jira_summary.error is not None:
+                    jira_errors[key] = jira_summary.error
+                    continue
+                jira_projects_ingested += 1
+                jira_tickets_ingested += jira_summary.tickets
+
             migrated = migrate_sqlite.migrate(sconn, tenant_slug)
             result = migrate_sqlite.record_phase6_run(
                 sconn, tenant_slug, migrated["idmap"]["work_item"],
@@ -110,14 +184,17 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         finally:
             sconn.close()
 
-        if summary.repo_errors:
-            # A repo-level failure is not a run-level failure (7.4c-b's
-            # isolation guarantee: "one repo's bad night must never wedge
-            # the poller for the other fourteen") — the run still succeeded
-            # for every repo that DID work. But it is worth recording, not
+        if summary.repo_errors or jira_errors:
+            # A repo- or Jira-project-level failure is not a run-level
+            # failure (7.4c-b's isolation guarantee: "one repo's bad night
+            # must never wedge the poller for the other fourteen", extended
+            # here to Jira projects) — the run still succeeded for every
+            # integration that DID work. But it is worth recording, not
             # silently dropped just because it didn't reach the severity of
             # failing the whole run.
-            detail = "; ".join(f"{repo}: {err}" for repo, err in summary.repo_errors.items())
+            parts = [f"{repo}: {err}" for repo, err in summary.repo_errors.items()]
+            parts += [f"jira:{key}: {err}" for key, err in jira_errors.items()]
+            detail = "; ".join(parts)
             with db.tenant_tx(tenant_id) as conn:
                 conn.execute("UPDATE ingest_run SET error_detail=%s WHERE id=%s",
                              (detail[:2000], run_id))
@@ -128,6 +205,10 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
             "prs_seen": summary.prs_seen,
             "work_items_ingested": summary.work_items_ingested,
             "work_items_failed": summary.work_items_failed,
+            "jira_projects_seen": len(jira_projects),
+            "jira_projects_ingested": jira_projects_ingested,
+            "jira_tickets_ingested": jira_tickets_ingested,
+            "jira_projects_failed": len(jira_errors),
             "FIRE": result["FIRE"], "SUPPRESSED": result["SUPPRESSED"],
             "ABSTAIN": result["ABSTAIN"],
         }
