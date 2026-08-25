@@ -123,3 +123,11 @@ SLACK_BOT_SCOPES = ",".join([
 # Slack's own documented replay window for signed requests.
 SLACK_REQUEST_MAX_AGE_SECONDS = int(
     os.environ.get("ARGUS_SLACK_REQUEST_MAX_AGE_SECONDS", "300"))
+
+# --- Phase 7.4c-c: the in-process ingestion poller -------------------------
+# Enabled only when explicitly requested (e.g. on Render with
+# ARGUS_INGEST_POLLER_ENABLED=1). Off by default so tests and dev environments
+# don't run an un-mocked background loop against live api.github.com.
+INGEST_POLLER_ENABLED = bool(int(os.environ.get("ARGUS_INGEST_POLLER_ENABLED", "0")))
+INGEST_POLL_INTERVAL_SECONDS = float(
+    os.environ.get("ARGUS_INGEST_POLL_INTERVAL_SECONDS", "30.0"))
