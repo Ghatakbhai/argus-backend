@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, github_app, ingest_worker, jira_crypto, slack_app, slack_crypto
+from . import config, db, github_app, ingest_worker, jira_crypto, linear_crypto, slack_app, slack_crypto
 from .auth import TenantContext, generate_key, hash_key, now_iso
 
 
@@ -121,6 +121,25 @@ class JiraCredentialsOut(BaseModel):
     integration_id: int
     project_key: str
     base_url: str
+    installed_at: str
+
+
+class LinearCredentialsIn(BaseModel):
+    """7.4c-e/§3.1.4: same hand-entered-by-an-admin shape as Jira's
+    credentials endpoint, simpler because Linear has a single global API
+    endpoint (no per-tenant `base_url` — see `linear_crypto.py`'s module
+    docstring) and a single-secret credential (no email, just one API key).
+    `team_key` is not secret and is stored in the clear on `integration`;
+    `api_key` is the real credential, encrypted at rest via `linear_crypto`
+    before it ever reaches the database."""
+    team_key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9]{0,9}$",
+                          description="Linear team key, e.g. ENG")
+    api_key: str
+
+
+class LinearCredentialsOut(BaseModel):
+    integration_id: int
+    team_key: str
     installed_at: str
 
 
@@ -388,6 +407,51 @@ def set_jira_credentials(slug: str, body: JiraCredentialsIn, _: Admin) -> JiraCr
         _audit(conn, tid, "admin", "jira.credentials", "ok", body.project_key)
     return JiraCredentialsOut(integration_id=row["id"], project_key=body.project_key,
                               base_url=body.base_url, installed_at=row["installed_at"])
+
+
+@app.post("/v1/admin/tenants/{slug}/linear/credentials", response_model=LinearCredentialsOut,
+         status_code=201)
+def set_linear_credentials(slug: str, body: LinearCredentialsIn, _: Admin) -> LinearCredentialsOut:
+    """7.4c-e/§3.1.4: same operational shape as `set_jira_credentials` above
+    — an ARGUS admin configures one Linear team's live API key for a
+    tenant, idempotently per (tenant, team). No `base_url` field: Linear
+    has one global API endpoint, already seeded onto this tenant's
+    `source` row at creation (`argus_seed_tenant_sources`, roles.sql).
+    """
+    if not config.LINEAR_CREDENTIAL_KEY:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "ARGUS_LINEAR_CREDENTIAL_KEY is not configured on this host — "
+                            "refusing to store a Linear credential in the clear.")
+    with db.admin_tx() as conn:
+        tenant = conn.execute("SELECT id FROM tenant WHERE slug=%s", (slug,)).fetchone()
+    if tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such tenant")
+    tid = str(tenant["id"])
+    at = now_iso()
+    ciphertext = linear_crypto.encrypt_credential(body.api_key, tid)
+    with db.tenant_tx(tid) as conn:
+        source = conn.execute("SELECT id FROM source WHERE name='linear'").fetchone()
+        if source is None:
+            # Every tenant is seeded with a 'linear' source row at creation
+            # (argus_seed_tenant_sources, roles.sql) — reaching here would
+            # mean that seeding itself regressed, not a normal runtime state.
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                "tenant has no 'linear' source row — seeding regression")
+        row = conn.execute(
+            """INSERT INTO integration (tenant_id, source_id, external_account_id,
+                                        display_name, scope, credential_ref, installed_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (tenant_id, source_id, external_account_id)
+               DO UPDATE SET credential_ref=EXCLUDED.credential_ref,
+                             installed_at=EXCLUDED.installed_at,
+                             revoked_at=NULL
+               RETURNING id, installed_at""",
+            (tid, source["id"], body.team_key, "https://api.linear.app", "team",
+             ciphertext, at),
+        ).fetchone()
+        _audit(conn, tid, "admin", "linear.credentials", "ok", body.team_key)
+    return LinearCredentialsOut(integration_id=row["id"], team_key=body.team_key,
+                                installed_at=row["installed_at"])
 
 
 # --- tenant surface --------------------------------------------------------
