@@ -29,7 +29,8 @@ _admin_pool: ConnectionPool | None = None
 # one. Anything added here must be idempotent — IF NOT EXISTS, CREATE OR
 # REPLACE, or guarded by a catalogue lookup — because it will be re-run every
 # time the service restarts.
-INCREMENTAL_MIGRATIONS = ("schema_7_3_slack.sql", "schema_owner_rls_bypass.sql")
+INCREMENTAL_MIGRATIONS = ("schema_7_3_slack.sql", "schema_owner_rls_bypass.sql",
+                          "schema_7_4_dashboard.sql", "schema_7_4c_ingest_worker.sql")
 
 
 def bootstrap_schema_if_needed() -> bool:
