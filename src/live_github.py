@@ -33,21 +33,45 @@ All stable, generally-available endpoints as of API version 2026-03-10 —
 the timeline endpoint in particular used to need a preview media type years
 ago and no longer does; confirmed live at 6.9 rather than assumed.
 
-Auth: a fine-grained or classic GitHub personal access token, read-only
-(Issues + Pull requests read permission is sufficient), passed as
-`Authorization: Bearer <token>` per GitHub's current docs. Never a
-username/password. Read from the `ARGUS_GITHUB_TOKEN` environment variable
-by the caller (`run_live_6_9.py`), not hardcoded here.
+Auth: a fine-grained or classic GitHub personal access token (6.9's
+original use), OR — since 7.4c-b — a short-lived GitHub App installation
+access token minted by `backend.github_app.InstallationTokenCache`. Both
+are passed identically, as `Authorization: Bearer <token>` per GitHub's
+current docs; this module never distinguishes the two and never mints or
+refreshes a token itself, it only spends whatever bearer token its caller
+hands it. Never a username/password.
 
-NOT YET LIVE-TESTED. This sandbox cannot reach api.github.com for a general
-REST call as of this session (only a separate, unrelated git-credential
-proxy for Claude's own repo tooling works, confirmed by direct test at
-6.9 — see DECISIONS.md). This module is built and importable, and its pure
-helper (`_bundle_from_responses`) is unit-tested against realistic canned
-JSON shaped like GitHub's own documented examples, the same standard 6.2/6.3
-held their adapters to before a live account existed. The HTTP-calling
-function itself (`fetch_work_item`) can only be proven end to end once
-Dirgh's network access change goes through.
+7.4c-b adds two more endpoints, for the live-ingestion path (D-156/§3.1.2
+step 4) that discovers repos and open PRs on its own rather than being
+handed (owner, repo, number) by a human:
+    GET /installation/repositories                          (App installs only)
+    GET /repos/{owner}/{repo}/pulls?state=open
+Both verified against GitHub's current REST docs directly, same house rule
+as the six above (D-111's Jira/Linear field-name bugs are why this project
+checks rather than remembers).
+
+STILL NOT LIVE-TESTED, confirmed again at 7.4c-b, not just carried over
+from 6.9. D-121 found this sandbox gets a structural 403 from Anthropic's
+own session infrastructure on any call to api.github.com, regardless of
+Dirgh's Admin Capabilities settings — re-confirmed directly this session
+(same 403, same proxy). New this session: the device bridge to Dirgh's own
+machine (`device_bash`, not available at D-121's time) was also tried, on
+the theory that it might route around the sandbox-level block since it
+runs on separate hardware — it does not: that shell's own egress proxy
+returns `blocked-by-allowlist` for api.github.com just as directly. Neither
+of the two places Claude can run code today can make a live call to
+GitHub's REST API. This module (both the 6.9 endpoints and 7.4c-b's two
+new ones) is built and importable, and is unit-tested against realistic
+canned JSON shaped like GitHub's own documented examples — `verify_live_github.py`
+for the original five endpoints, `verify_github_live_ingest.py` for the
+installation-scoped orchestration built at 7.4c-b — the same standard
+6.2/6.3 held their adapters to before a live account existed for them
+either. A real end-to-end proof against api.github.com needs either a
+future network-access change at the Anthropic-session level, or to run
+from the deployed Render host once 7.4c-c's poller exists there (D-135's
+precedent: the one other api.github.com call this project makes,
+`github_app.exchange_manifest_code`, already only ever runs on Render for
+exactly this reason).
 """
 
 from __future__ import annotations
@@ -217,6 +241,63 @@ def fetch_work_item(owner: str, repo: str, number: int, token: str,
         bundle.reviews_json = reviews if isinstance(reviews, list) else []
 
     return bundle
+
+
+def list_installation_repos(token: str, requested_at: str,
+                             max_pages: int = 10) -> list[tuple[str, str]]:
+    """Every repository a GitHub App installation access token can see, as
+    (owner, repo) pairs — the entry point 7.4c-b's live ingestion needs
+    that 6.9's `fetch_work_item`/`list_open_items` never did, since those
+    were always handed an (owner, repo) a human had already picked.
+
+    A personal access token has no "installation" and gets a 404/403 here
+    — this function is only meaningful with an App installation token, and
+    the caller (the future ingestion worker, 7.4c-c) is the one that knows
+    which kind of token it is holding.
+    """
+    pairs: list[tuple[str, str]] = []
+    page = 1
+    dummy_bundle = WorkItemBundle("(installation)", "(repos)", 0)
+    while page <= max_pages:
+        url = f"{API_ROOT}/installation/repositories?per_page=100&page={page}"
+        data = _get_with_retry(dummy_bundle, url, token, "installation_repos", requested_at)
+        if not data:
+            break
+        repos = data.get("repositories", [])
+        for r in repos:
+            owner_login = (r.get("owner") or {}).get("login")
+            name = r.get("name")
+            if owner_login and name:
+                pairs.append((owner_login, name))
+        if len(repos) < 100:
+            break
+        page += 1
+    return pairs
+
+
+def list_open_prs(owner: str, repo: str, token: str, requested_at: str,
+                   max_pages: int = 10) -> list[int]:
+    """Return the numbers of every currently-open pull request in a repo —
+    the PR-only counterpart to `list_open_items`, which hits `/issues` and
+    returns issues and PRs mixed together. 7.4c-b's live ingestion wants
+    PRs specifically (§3.1.2 step 4: "for each repo list open PRs"), so it
+    uses this rather than filtering `list_open_items`'s output after the
+    fact — one fewer place a plain issue could accidentally slip through.
+    """
+    numbers: list[int] = []
+    page = 1
+    dummy_bundle = WorkItemBundle(owner, repo, 0)
+    while page <= max_pages:
+        url = (f"{API_ROOT}/repos/{owner}/{repo}/pulls"
+               f"?state=open&per_page=100&page={page}")
+        data = _get_with_retry(dummy_bundle, url, token, "pr_list", requested_at)
+        if not data:
+            break
+        numbers.extend(pr["number"] for pr in data)
+        if len(data) < 100:
+            break
+        page += 1
+    return numbers
 
 
 def list_open_items(owner: str, repo: str, token: str, requested_at: str,
