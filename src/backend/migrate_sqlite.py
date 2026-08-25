@@ -125,6 +125,46 @@ def migrate(sqlite_source: str | sqlite3.Connection, tenant_slug: str) -> dict:
     sconn, owns_sconn = _open_source(sqlite_source)
     present = sqlite_tables(sconn)
 
+    # 7.4c-d: resolve ticket links BEFORE copying anything to Postgres, not
+    # after. `record_phase6_run()` (below, in every real call site — its
+    # `work_item_map` argument is `migrate()`'s own return value, so it is
+    # structurally always called second) needs `ticket_link` populated in
+    # THIS sqlite connection before `sprint_filter.run_pipeline` runs; but
+    # `migrate()` is what actually copies `ticket_link` into Postgres, and
+    # it copies each table exactly once, in the TABLES loop below. Doing
+    # the resolution here, first, means the Postgres copy reflects the
+    # real links a human (or `/v1/alerts`) would want to see — doing it
+    # only inside `record_phase6_run()`, as this session's first attempt
+    # did, left Postgres's `ticket_link` permanently empty even on a run
+    # that legitimately FIRED, because `migrate()` had already run and
+    # copied the pre-resolution (empty) table by the time resolution
+    # happened. Caught by this session's own Postgres integration test
+    # asserting a `ticket_link` row actually exists, not by re-reading the
+    # code — exactly the "checked by hand is not checked against a real
+    # case" lesson D-082 already named once for this project.
+    #
+    # Guarded on `not owns_sconn`: an open connection (the live-ingestion
+    # scratch DB every real caller of this function actually passes) is
+    # writable and shared with `record_phase6_run()`'s later call on the
+    # SAME object, so the write lands where it needs to. A bare file PATH
+    # (the Phase 6 CLI backfill / historical-fixture test convention) is
+    # opened read-only here (`_open_source`, `mode=ro`) specifically so a
+    # backfill can never mutate someone's original snapshot file — writing
+    # `ticket_link` there would raise `sqlite3.OperationalError`, and even
+    # if it didn't, `record_phase6_run()`'s own later call re-opens a
+    # SEPARATE read-only connection to the same path, which would never
+    # see this connection's in-memory changes anyway. That convention had
+    # no live ticket-link resolution before this session either (only
+    # `run_live_6_9.py`'s manual orchestration ever called `ingest_ticket_
+    # links` against a file-backed database, and it did so itself, on its
+    # own writable connection) — left exactly as-is, not a regression.
+    link_stats = None
+    if not owns_sconn and "ticket" in present and "work_item" in present:
+        import sprint_filter  # noqa: E402 — Phase 6's code, unmodified
+        wids = [r[0] for r in sconn.execute("SELECT id FROM work_item").fetchall()]
+        link_sources = [sprint_filter.link_sources_from_db(sconn, wid) for wid in wids]
+        link_stats = sprint_filter.ingest_ticket_links(sconn, link_sources, now_iso())
+
     with db.admin_tx() as conn:
         row = conn.execute("SELECT id FROM tenant WHERE slug=%s", (tenant_slug,)).fetchone()
         if row is None:
@@ -189,7 +229,7 @@ def migrate(sqlite_source: str | sqlite3.Connection, tenant_slug: str) -> dict:
             counts[table] = n
     if owns_sconn:
         sconn.close()
-    return {"tenant_id": tenant_id, "counts": counts, "idmap": idmap}
+    return {"tenant_id": tenant_id, "counts": counts, "idmap": idmap, "ticket_links": link_stats}
 
 
 def record_phase6_run(sqlite_source: str | sqlite3.Connection, tenant_slug: str,
@@ -220,6 +260,21 @@ def record_phase6_run(sqlite_source: str | sqlite3.Connection, tenant_slug: str,
     Passing `existing_run_id` makes this function UPDATE that row in place
     instead of inserting a new one; every other caller is completely
     unaffected; see D-162.
+
+    **7.4c-d (Jira live ingestion): a real, pre-existing gap, closed in
+    `migrate()`, not here — read that function's docstring for the full
+    story.** `sprint_filter.run_pipeline` (called below) has never itself
+    resolved ticket links; `migrate()` now does that, on the SAME open
+    connection, before it copies anything to Postgres, so by the time this
+    function runs `run_pipeline` the `ticket_link` rows `sprint_gate` reads
+    are already there — both in this sqlite connection AND, correctly,
+    in the Postgres copy `migrate()` already made. An earlier version of
+    this session's change resolved links HERE instead, which computed the
+    right in-memory verdict but left Postgres's own `ticket_link` table
+    permanently empty (`migrate()` had already run by the time this
+    function's resolution happened) — caught by this session's own
+    Postgres integration test actually querying for a `ticket_link` row,
+    not by re-reading the code.
     """
     # `digest`/`sprint_filter` live in src/, one directory above src/backend/.
     # `dashboard_payload` (imported at module level, above) already put that
@@ -232,6 +287,7 @@ def record_phase6_run(sqlite_source: str | sqlite3.Connection, tenant_slug: str,
     import sprint_filter  # noqa: E402
 
     sconn, owns_sconn = _open_source(sqlite_source)
+
     results = sprint_filter.run_pipeline(sconn)
     summary = sprint_filter.summarise(results)
 
