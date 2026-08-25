@@ -458,10 +458,25 @@ def set_linear_credentials(slug: str, body: LinearCredentialsIn, _: Admin) -> Li
 
 @app.get("/v1/me")
 def whoami(t: Tenant) -> dict[str, Any]:
+    """7.4c-f fix (D-16x): `person` was never a real table — not here, not
+    in the SQLite schema this one was modeled on (`actor.person_id` is a
+    documented-unused placeholder for a future cross-source identity
+    concept, schema.sql's own comment says so). Reading a table that was
+    never created is the actual bug D-160 named at 7.4c-a; the fix is to
+    show what this tenant genuinely has — its own `actor` rows classified
+    `kind='human'` (real developers ARGUS has seen in ingested GitHub/Jira/
+    Linear data), not to invent the never-built `person` table just to make
+    the old query succeed. `full_name`/`email`/`is_active` (the old query's
+    columns) don't exist on `actor` either — `email` in particular is a
+    real, separate, NOT-yet-built gap (Slack DM matching needs it, per
+    `config.py`'s own `users:read.email` scope comment) rather than
+    something safe to fabricate here.
+    """
     with db.tenant_tx(t.tenant_id) as conn:
         rows = conn.execute("SELECT slug, display_name, status FROM tenant").fetchall()
         members = conn.execute(
-            "SELECT id, full_name, email, is_active FROM person WHERE is_active=true ORDER BY id"
+            "SELECT id, display_name, source_key, kind FROM actor"
+            " WHERE kind='human' ORDER BY id"
         ).fetchall()
     return {"tenant": rows[0] if rows else None, "visible_tenant_rows": len(rows),
             "shadow_mode": not t.may_send_dms, "shadow_until": t.shadow_until,
@@ -496,11 +511,21 @@ def list_alerts(
     outcome: Annotated[Literal["FIRE", "SUPPRESSED", "ABSTAIN"] | None, Query()] = None,
     limit: int = 100,
 ) -> list[AlertOut]:
+    # 7.4c-f fix (D-16x): `w.item_key` was never a real column — neither
+    # here nor in the SQLite schema this Postgres one was modeled on.
+    # `sprint_filter.item_key()` (Phase 6, unchanged) computes it live from
+    # `project.source_key || '#' || work_item.source_number`; this query
+    # now does the same computation instead of selecting a column that has
+    # never existed, matching the join shape `slack_app.py`'s own
+    # `item_key_of` query already uses (`JOIN project p ON p.id =
+    # w.project_id AND p.tenant_id = w.tenant_id`).
     sql = ("SELECT a.*, f.verdict AS feedback,"
-           " w.item_key, w.title, w.url, a.detail"
+           " p.source_key || '#' || w.source_number AS item_key,"
+           " w.title, w.url, a.detail"
            " FROM alert a"
            " LEFT JOIN alert_feedback f ON f.alert_id = a.id"
-           " LEFT JOIN work_item w ON w.id = a.work_item_id")
+           " LEFT JOIN work_item w ON w.id = a.work_item_id AND w.tenant_id = a.tenant_id"
+           " LEFT JOIN project p ON p.id = w.project_id AND p.tenant_id = w.tenant_id")
     params: list[Any] = []
     if outcome:
         sql += " WHERE a.outcome = %s"
@@ -557,7 +582,18 @@ def latest_digest(
         if not row.get("payload_json"):
             raise HTTPException(409, "Digest has no structured payload")
         return json.loads(row["payload_json"])
-    return DigestOut(**{k: row[k] for k in DigestOut.model_fields if k in row})
+    # 7.4c-f fix (D-16x): a real, separate bug from the item_key/person
+    # ones above, only surfaced once `test_dashboard_contract.py`'s
+    # skipped tests were unblocked this session (a staged Phase 6 SQLite
+    # fixture had never been available before). `DigestOut` declares
+    # `payload_json: str | None = None` for the format=json path's own
+    # response shape reuse — but returning a `DigestOut` instance here
+    # ALWAYS serializes that field (as the real value, or `null`), even
+    # though CONTRACT.md's own text-format contract says it must be absent
+    # entirely, not merely empty. A plain dict, built the same way but
+    # excluding that one key, is what actually keeps the key out of the
+    # JSON rather than present-and-null.
+    return {k: row[k] for k in DigestOut.model_fields if k in row and k != "payload_json"}
 
 
 # ============================================================================
