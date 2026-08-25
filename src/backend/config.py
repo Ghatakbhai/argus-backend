@@ -131,3 +131,16 @@ SLACK_REQUEST_MAX_AGE_SECONDS = int(
 INGEST_POLLER_ENABLED = bool(int(os.environ.get("ARGUS_INGEST_POLLER_ENABLED", "0")))
 INGEST_POLL_INTERVAL_SECONDS = float(
     os.environ.get("ARGUS_INGEST_POLL_INTERVAL_SECONDS", "30.0"))
+
+# --- Phase 7.4c-d: Jira credential storage (§3.1.4) -------------------------
+# Jira has no App-install flow the way GitHub/Slack do — Blocker 4's design
+# (docs/PHASE7_5_OPERATIONAL_CHECKLIST.md §3.1.4) calls for generalizing
+# slack_crypto.py's proven AES-256-GCM-at-rest pattern rather than inventing
+# a second scheme. Deliberately a SEPARATE key from ARGUS_SLACK_TOKEN_KEY,
+# not reused: the two secrets protect different tenants' data end to end
+# (a Jira email+API-token pair vs. a Slack bot token) and rotating one must
+# never require touching the other. Same non-technical-owner-friendly rule
+# as SLACK_TOKEN_KEY — any string works, Render's "Generate Value" needs no
+# format knowledge — and the same consequence of losing it: every pilot's
+# Jira credentials would need re-entering, nothing else is compromised.
+JIRA_CREDENTIAL_KEY = os.environ.get("ARGUS_JIRA_CREDENTIAL_KEY")
