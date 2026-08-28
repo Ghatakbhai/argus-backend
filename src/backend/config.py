@@ -151,3 +151,15 @@ JIRA_CREDENTIAL_KEY = os.environ.get("ARGUS_JIRA_CREDENTIAL_KEY")
 # docstring for why this session chose not to share ARGUS_JIRA_CREDENTIAL_KEY
 # despite jira_crypto.py's own docstring floating that as an option.
 LINEAR_CREDENTIAL_KEY = os.environ.get("ARGUS_LINEAR_CREDENTIAL_KEY")
+
+# --- Milestone 2: the LLM Copilot layer (llm_copilot.py) -------------------
+# `ARGUS_LLM_API_KEY` is deliberately not defaulted to anything — an unset
+# key means `llm_copilot.py` never attempts a call at all (its own
+# Fail-Safe Fallback Invariant: no key configured is treated exactly like
+# "the call failed", not like a startup error, since this whole layer is
+# additive and ARGUS must work identically with it off). `ARGUS_LLM_PROVIDER`
+# defaults to 'google' (Gemini) per Dirgh's own locked-in decision — the
+# only provider `llm_copilot.py` implements today; a value it does not
+# recognize is handled the same permissive way, not a hard failure.
+LLM_PROVIDER = os.environ.get("ARGUS_LLM_PROVIDER", "google")
+LLM_API_KEY = os.environ.get("ARGUS_LLM_API_KEY")
