@@ -487,18 +487,27 @@ def compose_answered_blocks(item_key: str, response_type: str,
     """What the DM is rewritten to after a click. The buttons are REMOVED, not
     left in place looking clickable."""
     if response_type == "handled_offline":
-        line = (f":white_check_mark: *{item_key}* — you said this is handled offline. "
-                "ARGUS will stay quiet about it.")
+        badge = ":white_check_mark: *Handled offline*"
+        line = ("You said this is handled offline. ARGUS will stay quiet about it.")
     elif response_type == "blocked_on":
-        line = (f":construction: *{item_key}* — logged as blocked on: "
-                f"*{blocked_on_text}*. This goes into the morning digest.")
+        badge = ":construction: *Blocked*"
+        line = (f"Logged as blocked on: *{blocked_on_text}*. This goes into the "
+                "morning digest.")
     else:
         until = (snooze_until or "").replace("T", " ").replace("Z", " UTC")
-        line = f":alarm_clock: *{item_key}* — snoozed until {until}."
+        badge = ":alarm_clock: *Snoozed*"
+        line = f"Muted until {until}."
+    # Same three-part shape the live alert uses (`slack_dispatcher.
+    # compose_blocks`): a badge line, the sentence, then muted metadata. The
+    # resolved message is the last thing a person sees about this item, so it
+    # reading like a different product from the alert it replaced is exactly
+    # the inconsistency the design pass exists to remove.
     return [
+        {"type": "context",
+         "elements": [{"type": "mrkdwn", "text": f"{badge}  ·  `{item_key}`"}]},
         {"type": "section", "text": {"type": "mrkdwn", "text": line}},
         {"type": "context",
-         "elements": [{"type": "mrkdwn", "text": f"Recorded {answered_at}"}]},
+         "elements": [{"type": "mrkdwn", "text": f"_Recorded {answered_at}_"}]},
     ]
 
 
