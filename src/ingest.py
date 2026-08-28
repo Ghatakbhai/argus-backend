@@ -42,6 +42,14 @@ class WorkItemBundle:
         self.timeline_json: Optional[list] = None
         self.comments_json: Optional[list] = None
         self.reviews_json: Optional[list] = None
+        # Milestone 1 / Task 3: the two CI-state sources GitHub exposes for a
+        # PR's head commit. Both optional and both None by default, so every
+        # caller written before this existed (Tavily fixtures, 6.9's
+        # hand-picked fetches, every test in the suite) keeps producing
+        # exactly the readiness row it produced before -- 'unknown', which is
+        # the honest answer when nobody looked.
+        self.status_json: Optional[dict] = None       # GET /commits/{ref}/status
+        self.check_runs_json: Optional[dict] = None   # GET /commits/{ref}/check-runs
 
     def add_fetch(self, fa: FetchAttempt) -> None:
         self.fetches.append(fa)
@@ -101,6 +109,114 @@ def _log_fetches(conn: sqlite3.Connection, snapshot_id: int, bundle: WorkItemBun
         fid = insert_fetch(conn, snapshot_id, fa)
         last_fetch_id[fa.url] = fid
     return last_fetch_id
+
+
+# ---------------------------------------------------------------------------
+# CI state -- Milestone 1 / Task 3 (Pattern 1's missing input)
+# ---------------------------------------------------------------------------
+
+# GitHub reports a commit's CI health through two independent, overlapping
+# APIs, and a repo can legitimately use either, both, or neither:
+#
+#   * the legacy Commit Status API   (GET /commits/{ref}/status)
+#   * the Checks API                 (GET /commits/{ref}/check-runs)
+#
+# Both are read and merged, because reading only one would silently report
+# 'unknown' for every repo that happens to use the other -- which for
+# Pattern 1 means a real approved-green-idle PR never fires, the exact
+# failure mode D-161 named.
+#
+# The output is the schema's existing three-valued `readiness.checks_state`
+# ('clean' / 'blocked' / 'unknown'), NOT a new 'passed'/'failed'/'pending'
+# column. Two reasons: `schema.sql` section 8 and `schema_pg.sql` both pin
+# that column with a CHECK constraint and Phase 2's sections are frozen
+# (D-110), and `detectors.py:h4_blocked_readiness` and
+# `sprint_filter.evaluate_p1` already read exactly this column with exactly
+# this vocabulary. The milestone document's 'passed'/'failed'/'pending'
+# naming maps onto it one-for-one; only the spelling differs.
+#
+# PENDING MAPS TO 'unknown', NOT 'blocked'. A build still running is not a
+# failure. Calling it 'blocked' would make `h4_blocked_readiness` assert a
+# blocked-readiness stall on every PR whose CI simply had not finished when
+# the snapshot was taken -- inventing a claim out of an absence, which is
+# the one thing D-031/D-037/D-042 made this column three-valued to prevent.
+# Pattern 1 requires 'clean' as a positive condition, so a pending build
+# correctly produces ABSTAIN rather than a fired alert.
+
+# Conclusions that are real, negative evidence about the code.
+_CI_FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "action_required"})
+# Conclusions that are real, positive evidence. 'neutral' and 'skipped' are
+# here deliberately: GitHub treats them as non-blocking, and a repo whose
+# only check is a skipped path-filtered workflow has nothing red about it.
+_CI_PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# Everything else ('cancelled', 'stale', anything GitHub adds later) is
+# deliberately neither: a cancelled run is not proof the code is broken and
+# not proof it is fine, so it lands in 'unknown' by falling through.
+
+
+def map_checks_state(status_json: Optional[dict],
+                     check_runs_json: Optional[dict]) -> tuple[str, Optional[str]]:
+    """(checks_state, evidence_note) for one PR's head commit.
+
+    Precedence, strictest first, so that a mixed signal never rounds up:
+      1. anything failing anywhere        -> 'blocked'
+      2. anything still running anywhere  -> 'unknown'
+      3. at least one positive signal     -> 'clean'
+      4. nothing at all was reported      -> 'unknown'
+
+    Rule 2 sits ABOVE rule 3 on purpose: a commit with one green check and
+    one still-queued check is not a green commit, and treating it as one
+    would fire Pattern 1 on a PR whose CI is about to go red.
+    """
+    if status_json is None and check_runs_json is None:
+        return "unknown", None
+
+    failing: list[str] = []
+    running: list[str] = []
+    passing: list[str] = []
+    inconclusive: list[str] = []
+
+    if isinstance(status_json, dict):
+        combined = status_json.get("state")
+        total = status_json.get("total_count")
+        if total:  # zero statuses reports state='pending'; that is not a build
+            if combined == "success":
+                passing.append(f"combined status: success ({total})")
+            elif combined in ("failure", "error"):
+                failing.append(f"combined status: {combined} ({total})")
+            elif combined == "pending":
+                running.append(f"combined status: pending ({total})")
+            else:
+                inconclusive.append(f"combined status: {combined!r}")
+
+    if isinstance(check_runs_json, dict):
+        for run in check_runs_json.get("check_runs") or []:
+            if not isinstance(run, dict):
+                continue
+            name = run.get("name") or "(unnamed check)"
+            if run.get("status") != "completed":
+                running.append(f"{name}: {run.get('status')}")
+                continue
+            conclusion = run.get("conclusion")
+            if conclusion in _CI_FAILING_CONCLUSIONS:
+                failing.append(f"{name}: {conclusion}")
+            elif conclusion in _CI_PASSING_CONCLUSIONS:
+                passing.append(f"{name}: {conclusion}")
+            else:
+                inconclusive.append(f"{name}: {conclusion}")
+
+    def note(state: str, why: list[str]) -> tuple[str, str]:
+        return state, f"checks_state={state}; " + "; ".join(why[:6])
+
+    if failing:
+        return note("blocked", failing)
+    if running:
+        return note("unknown", running)
+    if passing:
+        return note("clean", passing)
+    if inconclusive:
+        return note("unknown", inconclusive)
+    return "unknown", "checks_state=unknown; no CI checks reported for this commit"
 
 
 def ingest_work_item(conn: sqlite3.Connection, snapshot_id: int, project_id: int,
@@ -190,11 +306,15 @@ def ingest_work_item(conn: sqlite3.Connection, snapshot_id: int, project_id: int
                 "clean": "clean", "unstable": "clean", "has_hooks": "clean",
                 "dirty": "blocked", "behind": "blocked",
             }.get(mergeable_state, "unknown")
+            checks_state, checks_note = map_checks_state(
+                bundle.status_json, bundle.check_runs_json)
+            evidence_note = f"mergeable_state from API: {mergeable_state!r}"
+            if checks_note:
+                evidence_note = f"{evidence_note} | {checks_note}"
             conn.execute(
                 """INSERT INTO readiness (work_item_id, merge_state, checks_state, cla_state, evidence_note)
                    VALUES (?,?,?,?,?)""",
-                (work_item_id, merge_state, "unknown", "unknown",
-                 f"mergeable_state from API: {mergeable_state!r}"),
+                (work_item_id, merge_state, checks_state, "unknown", evidence_note),
             )
         else:
             conn.execute(
