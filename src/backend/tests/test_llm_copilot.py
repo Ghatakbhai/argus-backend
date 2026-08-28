@@ -352,3 +352,188 @@ def test_the_request_body_never_carries_a_diff_or_a_secret(monkeypatch):
     assert "AKIAIOSFODNN7EXAMPLE" not in body_text
     assert "octocat" not in body_text
     assert "```" not in body_text
+
+
+# ===========================================================================
+# Phase 7.4X, Task 3.5 — the Executive Morning Briefing.
+#
+# The invariant this section exists to prove is stricter than the enrichment
+# feature's: `generate_enrichment` may return None and let the caller render
+# the raw alert, but a briefing has no raw form, so
+# `generate_morning_briefing` must ALWAYS return a valid, schema-shaped dict.
+# Every failure mode below therefore asserts a usable briefing came back, not
+# merely that nothing was raised.
+# ===========================================================================
+
+_ROWS = [
+    {"item_key": "rocket/api#41", "section": "blocked", "age_label": "3 days",
+     "headline": "Legal has not countersigned the DPA amendment"},
+    {"item_key": "rocket/api#42", "section": "escalation", "age_label": "6 days",
+     "headline": "octocat has been away 6 days"},
+    {"item_key": "rocket/api#43", "section": "awaiting", "age_label": "2 days",
+     "headline": "waiting on a reply"},
+]
+_STATS = {"items_checked": 12, "fired": 3, "suppressed": 4, "abstained": 5}
+
+
+def _valid_briefing() -> dict:
+    return {
+        "briefing_summary": "Two items need a decision this morning; the rest are moving.",
+        "critical_blocks": ["rocket/api#41 — waiting on Legal"],
+        "friction_items": ["rocket/api#43 — no reply for two days"],
+        "healthy_count": 99,
+    }
+
+
+def _briefing_keys(b: dict) -> set:
+    return {"briefing_summary", "critical_blocks", "friction_items", "healthy_count"} & set(b)
+
+
+def test_briefing_without_an_api_key_is_the_deterministic_summary():
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="")
+    assert b["source"] == "deterministic"
+    assert b["briefing_summary"] == "2 critical blocks, 3 items in-flight"
+    assert b["critical_blocks"] == ["rocket/api#41", "rocket/api#42"]
+    assert b["friction_items"] == ["rocket/api#43"]
+    assert b["healthy_count"] == 9          # 12 checked - 3 flagged
+
+
+def test_briefing_with_an_unrecognized_provider_falls_back_without_a_call(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("no network call may be made for an unknown provider")
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _boom)
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS,
+                                              provider="openai", api_key="fake-key")
+    assert b["source"] == "deterministic"
+
+
+def test_briefing_on_a_quiet_morning_says_zero_rather_than_inventing_work():
+    b = llm_copilot.generate_morning_briefing("t-1", [], {"items_checked": 7}, api_key="")
+    assert b["briefing_summary"] == "0 critical blocks, 0 items in-flight"
+    assert b["critical_blocks"] == [] and b["friction_items"] == []
+    assert b["healthy_count"] == 7
+
+
+def test_briefing_healthy_count_never_goes_negative_on_odd_inputs():
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, {"items_checked": 1}, api_key="")
+    assert b["healthy_count"] == 0
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, None, api_key="")
+    assert b["healthy_count"] == 0
+
+
+def test_a_well_formed_briefing_response_is_used(monkeypatch):
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen",
+                        _fake_urlopen_returning(_valid_briefing()))
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="fake-key")
+    assert b["source"] == "llm"
+    assert b["briefing_summary"].startswith("Two items need a decision")
+    assert b["critical_blocks"] == ["rocket/api#41 — waiting on Legal"]
+    assert _briefing_keys(b) == {"briefing_summary", "critical_blocks",
+                                 "friction_items", "healthy_count"}
+
+
+def test_the_models_healthy_count_is_discarded_for_the_engines_own(monkeypatch):
+    """A language model is the wrong instrument for arithmetic anyone can
+    check. The model says 99; the engine counted 9; 9 is what a lead sees."""
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen",
+                        _fake_urlopen_returning(_valid_briefing()))
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="fake-key")
+    assert b["healthy_count"] == 9
+
+
+def test_briefing_list_fields_are_capped_at_five(monkeypatch):
+    payload = dict(_valid_briefing(), critical_blocks=[f"item-{i}" for i in range(20)])
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen",
+                        _fake_urlopen_returning(payload))
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="fake-key")
+    assert len(b["critical_blocks"]) == 5
+
+
+@pytest.mark.parametrize("bad", [
+    {"briefing_summary": "", "critical_blocks": [], "friction_items": [], "healthy_count": 1},
+    {"critical_blocks": [], "friction_items": [], "healthy_count": 1},
+    {"briefing_summary": "ok", "critical_blocks": "not a list",
+     "friction_items": [], "healthy_count": 1},
+    ["not", "an", "object"],
+])
+def test_a_schema_invalid_briefing_falls_back_to_the_deterministic_one(monkeypatch, bad):
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen",
+                        _fake_urlopen_returning(bad))
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="fake-key")
+    assert b["source"] == "deterministic"
+    assert b["briefing_summary"] == "2 critical blocks, 3 items in-flight"
+
+
+def test_a_briefing_timeout_falls_back_to_the_deterministic_summary(monkeypatch):
+    """Task 3.3's own requirement, and the 3-second ceiling re-proven for
+    this second call rather than inherited from the first."""
+    def _slow(req, timeout=None):
+        assert timeout == 3.0, f"the 3-second ceiling was not applied: {timeout}"
+        raise TimeoutError("too slow")
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _slow)
+    b = llm_copilot.generate_morning_briefing("t-1", _ROWS, _STATS, api_key="fake-key")
+    assert b["source"] == "deterministic"
+
+
+def test_a_briefing_network_error_falls_back(monkeypatch):
+    def _down(req, timeout=None):
+        raise llm_copilot.urllib.error.URLError("no route to host")
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _down)
+    assert llm_copilot.generate_morning_briefing(
+        "t-1", _ROWS, _STATS, api_key="fake-key")["source"] == "deterministic"
+
+
+def test_a_briefing_http_error_falls_back(monkeypatch):
+    import io as _io
+
+    def _http(req, timeout=None):
+        raise llm_copilot.urllib.error.HTTPError(
+            "https://x", 429, "Too Many Requests", {}, _io.BytesIO(b'{"error":"quota"}'))
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _http)
+    assert llm_copilot.generate_morning_briefing(
+        "t-1", _ROWS, _STATS, api_key="fake-key")["source"] == "deterministic"
+
+
+def test_an_unexpected_exception_in_the_briefing_path_still_falls_back(monkeypatch):
+    def _weird(req, timeout=None):
+        raise RuntimeError("something nobody anticipated")
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _weird)
+    assert llm_copilot.generate_morning_briefing(
+        "t-1", _ROWS, _STATS, api_key="fake-key")["source"] == "deterministic"
+
+
+def test_the_briefing_prompt_carries_no_tenant_id_and_no_secrets(monkeypatch):
+    """The briefing's own version of the redaction proof, at the network
+    boundary. `tenant_id` identifies a paying customer and adds nothing to a
+    summary of their own items, so it is never sent."""
+    captured = {}
+
+    def _urlopen(req, timeout=None):
+        captured["body"] = req.data
+        return _fake_urlopen_returning(_valid_briefing())(req, timeout)
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _urlopen)
+
+    rows = _ROWS + [{"item_key": "rocket/api#44", "section": "awaiting",
+                     "headline": "deploy blocked, token AKIAIOSFODNN7EXAMPLE expired"}]
+    llm_copilot.generate_morning_briefing(
+        "acme-secret-tenant-uuid", rows, _STATS, api_key="fake-key")
+
+    body_text = captured["body"].decode("utf-8")
+    assert "AKIAIOSFODNN7EXAMPLE" not in body_text
+    assert "acme-secret-tenant-uuid" not in body_text
+    assert "rocket/api#41" in body_text        # the items themselves do go
+
+
+def test_the_briefing_prompt_is_bounded_on_a_very_large_morning(monkeypatch):
+    captured = {}
+
+    def _urlopen(req, timeout=None):
+        captured["body"] = req.data
+        return _fake_urlopen_returning(_valid_briefing())(req, timeout)
+    monkeypatch.setattr(llm_copilot.urllib.request, "urlopen", _urlopen)
+
+    rows = [{"item_key": f"rocket/api#{i}", "section": "awaiting",
+             "headline": "waiting"} for i in range(500)]
+    llm_copilot.generate_morning_briefing("t-1", rows, {"items_checked": 500},
+                                          api_key="fake-key")
+    assert captured["body"].decode("utf-8").count("rocket/api#") <= 25
