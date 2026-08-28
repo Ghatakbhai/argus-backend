@@ -268,7 +268,13 @@ def test_cached_identity_is_reused_without_a_second_lookup(client, live_tenant):
 # 3. Failure and skip paths — every one an explicit, recorded outcome.
 # ---------------------------------------------------------------------------
 
-def test_unresolvable_identity_is_a_failed_outcome_not_an_exception(client, live_tenant):
+def test_unresolvable_identity_is_suppressed_and_recorded_not_a_silent_failure(
+        client, live_tenant):
+    """Pre-Milestone 2 slice (D-171): an unresolved identity used to be a
+    FAILED outcome with NO triage_message row at all — indistinguishable
+    from a real operational error, and invisible to anyone auditing later
+    why a FIRE alert never reached a person. It is now recorded as its own
+    explicit, non-error status."""
     tid = live_tenant["id"]
     seeded = _seed_fire_alert(tid, live_tenant["integration_id"])
     fake = FakeSlack(lookup_email_to_user={})  # email known, but Slack has nobody
@@ -278,11 +284,18 @@ def test_unresolvable_identity_is_a_failed_outcome_not_an_exception(client, live
             conn, tid, ingest_run_id=seeded["run_id"], now=now_iso(), transport=fake,
             email_for_login=lambda login: "octocat@example.com")
 
-    assert summary.failed == 1
+    assert summary.skipped == 1
+    assert summary.failed == 0
     assert summary.results[0].reason == "recipient_unresolved"
+    assert summary.results[0].triage_message_id is not None
     with db.tenant_tx(tid) as conn:
-        assert conn.execute("SELECT count(*) AS n FROM triage_message"
-                            ).fetchone()["n"] == 0
+        row = conn.execute(
+            "SELECT status, suppressed_reason, external_channel_id, external_message_ts"
+            " FROM triage_message").fetchone()
+        assert row["status"] == "suppressed_unresolved_identity"
+        assert row["suppressed_reason"]
+        assert row["external_channel_id"] is None
+        assert row["external_message_ts"] is None
 
 
 def test_bot_actor_is_skipped(client, live_tenant):
@@ -309,4 +322,117 @@ def test_no_transport_is_a_failed_outcome(client, live_tenant):
             conn, tid, ingest_run_id=seeded["run_id"], now=now_iso())  # transport=None
     assert summary.failed == 1
     assert summary.results[0].reason == "no_slack_transport"
+
+
+# ---------------------------------------------------------------------------
+# 5. Pre-Milestone 2 slice (D-171): the 3-tier `email_for_login` resolver.
+# ---------------------------------------------------------------------------
+
+def test_email_resolver_tier1_explicit_map_wins_over_domain_guess(client, live_tenant):
+    tid = live_tenant["id"]
+    with db.admin_tx() as conn:
+        conn.execute("UPDATE tenant SET email_domain = 'rocket.example' WHERE id = %s", (tid,))
+    with db.tenant_tx(tid) as conn:
+        conn.execute(
+            "INSERT INTO tenant_identity_map (tenant_id, github_login, email)"
+            " VALUES (%s,'octocat','octo.the.cat@realmail.example')", (tid,))
+        resolver = slack_dispatcher.build_email_resolver(conn, tid)
+        assert resolver("octocat") == "octo.the.cat@realmail.example"
+        # A login with no explicit row still falls through to tier 2.
+        assert resolver("hubot") == "hubot@rocket.example"
+
+
+def test_email_resolver_tier2_domain_guess_when_no_explicit_map(client, live_tenant):
+    tid = live_tenant["id"]
+    with db.admin_tx() as conn:
+        conn.execute("UPDATE tenant SET email_domain = 'rocket.example' WHERE id = %s", (tid,))
+    with db.tenant_tx(tid) as conn:
+        resolver = slack_dispatcher.build_email_resolver(conn, tid)
+    assert resolver("octocat") == "octocat@rocket.example"
+
+
+def test_email_resolver_tier3_none_when_neither_configured(client, live_tenant):
+    tid = live_tenant["id"]
+    with db.tenant_tx(tid) as conn:
+        resolver = slack_dispatcher.build_email_resolver(conn, tid)
+    assert resolver("octocat") is None
+
+
+def test_email_resolver_is_wired_into_a_real_dispatch(client, live_tenant):
+    """End-to-end: the resolver this module builds is what
+    `dispatch_tenant_triage_dms` actually uses when the caller passes it —
+    the exact way `ingest_worker.run_one()` now calls it."""
+    tid, integration_id = live_tenant["id"], live_tenant["integration_id"]
+    with db.admin_tx() as conn:
+        conn.execute("UPDATE tenant SET email_domain = 'rocket.example' WHERE id = %s", (tid,))
+    seeded = _seed_fire_alert(tid, integration_id)
+    fake = FakeSlack(lookup_email_to_user={"octocat@rocket.example": "U777"})
+
+    with db.tenant_tx(tid) as conn:
+        resolver = slack_dispatcher.build_email_resolver(conn, tid)
+        summary = slack_dispatcher.dispatch_tenant_triage_dms(
+            conn, tid, ingest_run_id=seeded["run_id"], now=now_iso(), transport=fake,
+            email_for_login=resolver)
+
+    assert summary.sent == 1
+    assert summary.results[0].slack_user_id == "U777"
+
+
+# ---------------------------------------------------------------------------
+# 6. Milestone 2, Task 5.2: cached copilot enrichment renders in the DM.
+# ---------------------------------------------------------------------------
+
+def test_copilot_enrichment_cached_in_digest_delivery_renders_in_the_dm(client, live_tenant):
+    """`dispatch_tenant_triage_dms` reads the SAME `copilot` dict already
+    computed and cached by `dashboard_payload.build_dashboard_payload` at
+    ingest time — proven here without a real LLM call, exactly the way this
+    project proves every other Slack-facing behavior (a fake transport, a
+    hand-built payload row standing in for what `migrate_sqlite.
+    record_phase6_run` would have written)."""
+    tid, integration_id = live_tenant["id"], live_tenant["integration_id"]
+    seeded = _seed_fire_alert(tid, integration_id)
+    copilot = {"summary_tldr": "Blocked on a Stripe webhook review; nothing else pending.",
+              "blocking_dependency": "Stripe webhook approval",
+              "action_draft": "Hey — can you take a quick look, or should I reassign?",
+              "suggested_recipient_role": "reviewer"}
+    with db.tenant_tx(tid) as conn:
+        payload = {"digest": {"rows": [
+            {"work_item_id": seeded["work_item_id"], "copilot": copilot},
+        ]}}
+        conn.execute(
+            "INSERT INTO digest_delivery (tenant_id, ingest_run_id, channel, status,"
+            " rendered_text, payload_json, delivered_at)"
+            " VALUES (%s,%s,'dashboard','shadow','<html></html>',%s,%s)",
+            (tid, seeded["run_id"], json.dumps(payload), now_iso()))
+
+    fake = FakeSlack(lookup_email_to_user={"octocat@example.com": "U999"})
+    with db.tenant_tx(tid) as conn:
+        summary = slack_dispatcher.dispatch_tenant_triage_dms(
+            conn, tid, ingest_run_id=seeded["run_id"], now=now_iso(), transport=fake,
+            email_for_login=lambda login: "octocat@example.com")
+
+    assert summary.sent == 1
+    posted_blocks = fake.calls[2][1]["blocks"]
+    assert any(copilot["summary_tldr"] in json.dumps(b) for b in posted_blocks)
+    button_values = [json.loads(el["value"]) for b in posted_blocks if b["type"] == "actions"
+                     for el in b["elements"]]
+    assert all(v["action_draft"] == copilot["action_draft"] for v in button_values)
+
+
+def test_no_cached_copilot_renders_exactly_as_before(client, live_tenant):
+    """No digest_delivery row at all (or one with no copilot data) must
+    render identically to how this module behaved before Milestone 2 —
+    the Fail-Safe Fallback Invariant, proven at the dispatcher layer too."""
+    tid, integration_id = live_tenant["id"], live_tenant["integration_id"]
+    seeded = _seed_fire_alert(tid, integration_id)
+    fake = FakeSlack(lookup_email_to_user={"octocat@example.com": "U999"})
+    with db.tenant_tx(tid) as conn:
+        summary = slack_dispatcher.dispatch_tenant_triage_dms(
+            conn, tid, ingest_run_id=seeded["run_id"], now=now_iso(), transport=fake,
+            email_for_login=lambda login: "octocat@example.com")
+    assert summary.sent == 1
+    posted_blocks = fake.calls[2][1]["blocks"]
+    # Same section count as the no-copilot path always had: title, ask,
+    # evidence context, actions — no extra TL;DR section inserted.
+    assert len([b for b in posted_blocks if b["type"] == "section"]) == 2
 
