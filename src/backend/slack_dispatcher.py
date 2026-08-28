@@ -233,6 +233,60 @@ def resolve_identity(conn, tenant_id: str, integration_id: int, actor_id: int,
 
 
 # ===========================================================================
+# 2b. Pre-Milestone 2 slice (D-171): the 3-tier `email_for_login` resolver.
+#
+# `resolve_identity` above has had this exact contract since it was written
+# (see the module docstring's item 1) — what has never existed is a real
+# implementation of it. `ingest_worker.run_one()` has always called
+# `dispatch_tenant_triage_dms()` with `email_for_login=None` (D-170), so
+# every identity resolves 'unresolved' and no live DM has ever reached a
+# real person. This closes that, in priority order:
+#
+#   1. `tenant_identity_map` — an explicit, human-confirmed
+#      github_login -> email row. Most trustworthy: a person said so,
+#      exactly the same trust level `manual_map` already has for the
+#      login -> slack_user_id step one level up.
+#   2. `tenant.email_domain` — a per-tenant heuristic, `{login}@{domain}`,
+#      for the common (not universal) case where a company's GitHub
+#      handles already match their email's local part. Wrong for anyone
+#      whose GitHub login isn't their email prefix — tier 1 exists
+#      precisely to let a human override this per person.
+#   3. Neither present -> None. Not a failure: `dispatch_one` below writes
+#      an explicit `suppressed_unresolved_identity` `triage_message` row
+#      for this case rather than silently producing no record at all.
+# ===========================================================================
+
+def build_email_resolver(conn, tenant_id: str) -> Callable[[str], Optional[str]]:
+    """Returns a closure matching the `email_for_login` contract, backed by
+    this tenant's own `tenant_identity_map` rows and `tenant.email_domain`.
+
+    Reads `tenant.email_domain` once, at build time, rather than per call —
+    it does not change mid-dispatch and a tenant typically has many alerts
+    to resolve in one run. `tenant_identity_map` IS looked up per login: it
+    is exactly one indexed row read (the primary key is `(tenant_id,
+    github_login)`), and re-reading it per call means a mapping added by an
+    admin mid-run is picked up by the very next alert, not just the next
+    ingest run.
+    """
+    row = conn.execute("SELECT email_domain FROM tenant WHERE id = %s",
+                       (tenant_id,)).fetchone()
+    domain = (row["email_domain"] if row else None) or None
+
+    def _resolve(login: str) -> Optional[str]:
+        mapped = conn.execute(
+            "SELECT email FROM tenant_identity_map"
+            " WHERE tenant_id = %s AND github_login = %s",
+            (tenant_id, login)).fetchone()
+        if mapped and mapped["email"]:
+            return mapped["email"]
+        if domain:
+            return f"{login}@{domain}"
+        return None
+
+    return _resolve
+
+
+# ===========================================================================
 # 3. Composing the message.
 # ===========================================================================
 
@@ -243,20 +297,42 @@ def _item_url(conn, work_item_id: Optional[int]) -> Optional[str]:
     return row["url"] if row else None
 
 
-def _button_value(alert_row: dict) -> str:
+def _button_value(alert_row: dict, copilot: Optional[dict] = None) -> str:
     """Carried on the button for auditing / a human reading a raw payload.
     Never trusted as a lookup key — `handle_interaction` matches purely on
     (channel, message ts), which is server-known, not client-supplied. Same
-    contract `slack_triage.button_value` documents."""
-    return json.dumps({"v": 1, "alert_id": alert_row["id"],
-                       "work_item_id": alert_row["work_item_id"],
-                       "pattern": alert_row["pattern"]}, separators=(",", ":"))[:2000]
+    contract `slack_triage.button_value` documents.
+
+    Milestone 2, Task 5.2: when a copilot enrichment exists for this alert,
+    its `action_draft` rides along on the button value too — "pre-fill
+    callback data with copilot.action_draft" per the milestone doc. Nothing
+    downstream reads it yet (`handle_interaction` matches on channel/ts, per
+    the docstring above), but it makes the draft available to a future
+    "start from this text" flow without a second lookup, and it is discarded
+    from `alert_row` itself so a raw alert payload never carries LLM output
+    as if it were part of the deterministic record."""
+    value = {"v": 1, "alert_id": alert_row["id"],
+             "work_item_id": alert_row["work_item_id"], "pattern": alert_row["pattern"]}
+    if copilot and copilot.get("action_draft"):
+        value["action_draft"] = copilot["action_draft"]
+    return json.dumps(value, separators=(",", ":"))[:2000]
 
 
-def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str]) -> list[dict]:
+def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str],
+                   copilot: Optional[dict] = None) -> list[dict]:
     """The Block Kit body of one triage DM. Same three-second-read shape as
     `slack_triage.compose_blocks`: what, why, three buttons — using the
-    action ids `slack_app.handle_interaction` already recognises."""
+    action ids `slack_app.handle_interaction` already recognises.
+
+    `copilot`, if given (Milestone 2, Task 5.2), is the enrichment dict
+    already computed and cached at ingest time — see `llm_copilot.py` and
+    `dashboard_payload.py`'s per-row `copilot` field, the SAME dict a
+    dashboard reader sees, never a fresh LLM call made here. Its
+    `summary_tldr` renders as its own section, ahead of the raw evidence
+    line, and never replaces that line — the deterministic evidence stays
+    the thing a person can argue with; the summary is additive framing on
+    top of it, matching the Copilot Invariant (LLM strictly downstream,
+    never the reason an alert fired)."""
     headline = PATTERN_HEADLINE.get(alert_row["pattern"] or "", "This item looks stuck")
     ask = PATTERN_ASK.get(alert_row["pattern"] or "", "")
     title = f"*{headline}*\n<{item_url}|{item_key}>" if item_url else f"*{headline}*\n`{item_key}`"
@@ -264,6 +340,9 @@ def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str]) -> l
     blocks: list[dict] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": title}},
     ]
+    if copilot and copilot.get("summary_tldr"):
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn", "text": copilot["summary_tldr"]}})
     if ask:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ask}})
     if alert_row.get("reason"):
@@ -273,7 +352,7 @@ def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str]) -> l
         blocks.append({"type": "context",
                        "elements": [{"type": "mrkdwn", "text": f"_{alert_row['reason']}_"}]})
 
-    val = _button_value(alert_row)
+    val = _button_value(alert_row, copilot)
     blocks.append({
         "type": "actions",
         "block_id": "argus_triage_actions",
@@ -319,7 +398,8 @@ def _already_dispatched(conn, work_item_id: Optional[int], ticket_id: Optional[i
 def dispatch_one(conn, tenant_id: str, integration_id: int, alert_row: dict, now: str,
                  transport: Optional[SlackTransport],
                  email_for_login: Optional[Callable[[str], Optional[str]]] = None,
-                 manual_map: Optional[dict[str, str]] = None) -> DispatchResult:
+                 manual_map: Optional[dict[str, str]] = None,
+                 copilot: Optional[dict] = None) -> DispatchResult:
     """One FIRE alert -> at most one DM -> exactly one explicit outcome.
     Never raises for an ordinary Slack or identity failure — those are
     outcomes, not exceptions. Only a caller error (see `TenantNotLive`, and a
@@ -357,8 +437,30 @@ def dispatch_one(conn, tenant_id: str, integration_id: int, alert_row: dict, now
     ident = resolve_identity(conn, tenant_id, integration_id, alert_row["subject_actor_id"],
                              login, transport, now, email_for_login, manual_map)
     if not ident.ok:
-        return DispatchResult(**base, outcome=FAILED, reason="recipient_unresolved",
-                              recipient_login=login, detail=ident.detail)
+        # Pre-Milestone 2 slice (D-171): an unresolved identity is a normal,
+        # expected state — most tenants have no `tenant_identity_map` row
+        # and no `email_domain` configured yet — not an operational failure
+        # worth a `logger.warning` on every run. Recorded as its own
+        # `triage_message` status (`suppressed_unresolved_identity`, widened
+        # into the CHECK constraint by schema_identity_resolution.sql) so a
+        # human reading the audit trail later can see WHY nobody was DMed
+        # about a real FIRE alert, the same discipline `resolve_identity`'s
+        # own docstring already holds `slack_identity` to. No
+        # `external_channel_id`/`external_message_ts` exist for this row —
+        # no message was ever composed, let alone sent — which is exactly
+        # what the widened `triage_message_check1` constraint now allows for
+        # this status, matching 'suppressed_presence' before it.
+        row = conn.execute(
+            "INSERT INTO triage_message"
+            "   (tenant_id, integration_id, work_item_id, ticket_id, sent_to_actor_id,"
+            "    sent_at, status, suppressed_reason)"
+            " VALUES (%s,%s,%s,%s,%s,%s,'suppressed_unresolved_identity',%s) RETURNING id",
+            (tenant_id, integration_id, alert_row.get("work_item_id"),
+             alert_row.get("ticket_id"), alert_row["subject_actor_id"], now,
+             ident.detail)).fetchone()
+        return DispatchResult(**base, outcome=SKIPPED, reason="recipient_unresolved",
+                              recipient_login=login, triage_message_id=row["id"],
+                              detail=ident.detail)
 
     item_key = slack_app.item_key_of(conn, alert_row.get("work_item_id"))
     item_url = _item_url(conn, alert_row.get("work_item_id"))
@@ -374,7 +476,7 @@ def dispatch_one(conn, tenant_id: str, integration_id: int, alert_row: dict, now
         posted = transport.call(
             "chat.postMessage", channel=channel_id,
             text=compose_fallback_text(alert_row, item_key),
-            blocks=compose_blocks(alert_row, item_key, item_url))
+            blocks=compose_blocks(alert_row, item_key, item_url, copilot))
         message_ts = posted.get("ts")
         if not message_ts:
             return DispatchResult(**base, outcome=FAILED, reason="no_message_ts",
@@ -470,10 +572,38 @@ def dispatch_tenant_triage_dms(
             "   AND outcome = 'FIRE'",
             (tenant_id, ingest_run_id)).fetchall()
 
+    # Milestone 2, Task 5.2: read back the SAME `copilot` enrichment already
+    # computed once and cached in `digest_delivery.payload_json` at ingest
+    # time (`dashboard_payload.build_dashboard_payload`'s per-row `copilot`
+    # field, see llm_copilot.py) — never a fresh LLM call made from this
+    # module. Keyed by `work_item_id`, the same id `digest.DigestRow` and
+    # `alert` both carry. A run with no digest_delivery row yet (the
+    # `alert_ids=[...]` synthetic-run-id=0 shape some tests/backfills use)
+    # or no `payload_json` simply dispatches with no copilot enrichment —
+    # the Fail-Safe Fallback Invariant applies here too, not just inside
+    # llm_copilot.py itself.
+    copilot_by_item: dict[int, dict] = {}
+    delivery = conn.execute(
+        "SELECT payload_json FROM digest_delivery"
+        " WHERE tenant_id = %s AND ingest_run_id = %s"
+        " ORDER BY id DESC LIMIT 1",
+        (tenant_id, ingest_run_id)).fetchone()
+    if delivery and delivery.get("payload_json"):
+        try:
+            payload = json.loads(delivery["payload_json"])
+            for row in (payload.get("digest") or {}).get("rows", []):
+                if row.get("work_item_id") is not None and row.get("copilot"):
+                    copilot_by_item[row["work_item_id"]] = row["copilot"]
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("slack_dispatcher: could not read copilot enrichment from"
+                           " digest_delivery for tenant %s run %s: %s",
+                           tenant_id, ingest_run_id, exc)
+
     summary = DispatchSummary(tenant_id=tenant_id)
     for alert_row in rows:
+        copilot = copilot_by_item.get(alert_row.get("work_item_id"))
         result = dispatch_one(conn, tenant_id, integration_id, dict(alert_row), now,
-                              transport, email_for_login, manual_map)
+                              transport, email_for_login, manual_map, copilot)
         summary.results.append(result)
         if result.outcome == FAILED:
             logger.warning("slack_dispatcher: alert %s failed to dispatch for tenant %s: %s",
