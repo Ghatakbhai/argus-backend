@@ -56,7 +56,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import config, db, github_app, jira_crypto, linear_crypto, migrate_sqlite
+from . import config, db, github_app, jira_crypto, linear_crypto, migrate_sqlite, slack_dispatcher
 from .auth import now_iso
 
 # `github_live_ingest`/`jira_live_ingest`/`linear_live_ingest` and the frozen
@@ -244,7 +244,44 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         finally:
             sconn.close()
 
-        if summary.repo_errors or jira_errors or linear_errors:
+        # Milestone 1, Task 5.5 (D-167's own deferred item, closed here):
+        # `slack_dispatcher.dispatch_tenant_triage_dms()` wired into the
+        # post-detection step, for every run — shadow or live. The function
+        # itself is the one place that enforces "no live Slack traffic for
+        # a non-'live' tenant" (its own module docstring's "ONE HARD
+        # INVARIANT"); catching `TenantNotLive` here is what lets detection
+        # keep running silently for a shadow tenant while delivery
+        # correctly does not, matching 7.4c-c's design — not a workaround
+        # of that rule. It is also raised for a 'live' tenant with no Slack
+        # workspace connected yet, an equally normal mid-onboarding state.
+        #
+        # `email_for_login` is left at its default (None), named plainly
+        # rather than faked: nothing in this codebase yet resolves a GitHub
+        # login to an email address (see slack_dispatcher.py's own
+        # docstring on the two things the milestone doc got wrong about
+        # this contract) — every identity will resolve as 'unresolved'
+        # until a real source of truth exists. That is a known, separate
+        # gap, not something this wiring step can close, and leaving it
+        # unresolved rather than inventing one is the same discipline
+        # `readiness.checks_state='unknown'` already holds itself to.
+        slack_error: str | None = None
+        slack_summary = None
+        try:
+            with db.tenant_tx(tenant_id) as conn:
+                slack_summary = slack_dispatcher.dispatch_tenant_triage_dms(
+                    conn, tenant_id, result["ingest_run_id"], now_iso())
+        except slack_dispatcher.TenantNotLive:
+            pass
+        except Exception as exc:
+            # Same isolation rule as a repo/Jira-project/Linear-team
+            # failure below: a Slack-side problem costs Slack delivery for
+            # this run, not the run itself — every alert is already
+            # recorded in Postgres regardless of whether a DM went out.
+            slack_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("ingest_run %s (tenant %s): slack dispatch failed: %s",
+                           run_id, tenant_slug, slack_error)
+
+        if summary.repo_errors or jira_errors or linear_errors or slack_error:
             # A repo-, Jira-project-, or Linear-team-level failure is not a
             # run-level failure (7.4c-b's isolation guarantee: "one repo's
             # bad night must never wedge the poller for the other
@@ -256,6 +293,8 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
             parts = [f"{repo}: {err}" for repo, err in summary.repo_errors.items()]
             parts += [f"jira:{key}: {err}" for key, err in jira_errors.items()]
             parts += [f"linear:{key}: {err}" for key, err in linear_errors.items()]
+            if slack_error:
+                parts.append(f"slack: {slack_error}")
             detail = "; ".join(parts)
             with db.tenant_tx(tenant_id) as conn:
                 conn.execute("UPDATE ingest_run SET error_detail=%s WHERE id=%s",
@@ -277,6 +316,9 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
             "linear_teams_failed": len(linear_errors),
             "FIRE": result["FIRE"], "SUPPRESSED": result["SUPPRESSED"],
             "ABSTAIN": result["ABSTAIN"],
+            "slack_dms_sent": slack_summary.sent if slack_summary else 0,
+            "slack_dms_skipped": slack_summary.skipped if slack_summary else 0,
+            "slack_dms_failed": slack_summary.failed if slack_summary else 0,
         }
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
