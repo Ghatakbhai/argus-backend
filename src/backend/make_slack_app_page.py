@@ -29,78 +29,33 @@ import html
 import json
 import sys
 
+from . import web_theme
 from .slack_app import build_manifest
 
+PAGE_CSS = """\
+/* Page-specific only — everything else comes from web_theme.CSS. */
+#copied{margin-left:10px;font-size:12px;color:var(--ok-text)}
+pre{max-height:520px}
+"""
+
 TEMPLATE = """<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Create the ARGUS Slack app</title>
 <style>
-  :root {{
-    --bg: #f6f7f9; --card: #ffffff; --ink: #14171a; --muted: #5b6572;
-    --line: #dfe3e8; --accent: #1f6feb; --accent-ink: #ffffff;
-    --ok-bg: #e8f5ec; --ok-line: #b7dfc4; --ok-ink: #17612f;
-    --warn-bg: #fff6e0; --warn-line: #f0d9a0; --warn-ink: #6b4e00;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #0f1216; --card: #171b21; --ink: #e8ecf1; --muted: #9aa4b2;
-      --line: #2a313a; --accent: #4c8dff; --accent-ink: #0b0e12;
-      --ok-bg: #12301d; --ok-line: #2c5c3c; --ok-ink: #9fe0b5;
-      --warn-bg: #2e2612; --warn-line: #5c4a1f; --warn-ink: #f0d9a0;
-    }}
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; padding: 32px 20px 64px; background: var(--bg); color: var(--ink);
-    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }}
-  .wrap {{ max-width: 720px; margin: 0 auto; }}
-  .card {{
-    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-    padding: 28px; margin-bottom: 20px;
-  }}
-  h1 {{ font-size: 25px; margin: 0 0 6px; letter-spacing: -0.01em; }}
-  h2 {{ font-size: 15px; margin: 0 0 12px; text-transform: uppercase;
-       letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }}
-  p {{ margin: 0 0 14px; }}
-  .lede {{ color: var(--muted); margin-bottom: 22px; }}
-  ol {{ margin: 0 0 4px; padding-left: 22px; }}
-  li {{ margin-bottom: 10px; }}
-  a {{ color: var(--accent); }}
-  code {{
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
-    padding: 1px 5px;
-  }}
-  pre {{
-    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 14px; overflow-x: auto; max-height: 340px;
-    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }}
-  button {{
-    background: var(--accent); color: var(--accent-ink); border: 0;
-    border-radius: 8px; padding: 11px 18px; font-size: 15px; font-weight: 600;
-    cursor: pointer;
-  }}
-  table {{ border-collapse: collapse; width: 100%; margin-bottom: 6px; }}
-  th, td {{ text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line);
-           vertical-align: top; font-size: 14.5px; }}
-  th {{ color: var(--muted); font-weight: 600; white-space: nowrap; }}
-  .note {{ background: var(--ok-bg); border: 1px solid var(--ok-line); color: var(--ok-ink);
-          border-radius: 8px; padding: 14px 16px; font-size: 14.5px; margin-bottom: 16px; }}
-  .warn {{ background: var(--warn-bg); border: 1px solid var(--warn-line);
-          color: var(--warn-ink); border-radius: 8px; padding: 14px 16px;
-          font-size: 14.5px; }}
-</style>
+{css}
+{page_css}</style>
 </head>
 <body>
 <div class="wrap">
+{brandbar}
 
-  <div class="card">
-    <h1>Create the ARGUS Slack app</h1>
+  <div class="card card--info">
+    <span class="badge badge-info"><span class="dot"></span>Setup</span>
+    <h1 style="margin-top:var(--s3)">Create the ARGUS Slack app</h1>
     <p class="lede">One app, installed by every pilot team's workspace. This
     takes about three minutes and nothing here can break the running
     backend.</p>
@@ -123,8 +78,8 @@ TEMPLATE = """<!doctype html>
       <li>Choose the <b>JSON</b> tab, paste the manifest below, and click
           <b>Next</b> then <b>Create</b>.</li>
     </ol>
-    <p><button onclick="copyManifest()">Copy the manifest</button>
-       <span id="copied" style="margin-left:10px;color:var(--muted)"></span></p>
+    <p><button class="btn btn-primary" onclick="copyManifest()">Copy the manifest</button>
+       <span id="copied"></span></p>
     <pre id="manifest">{manifest_html}</pre>
   </div>
 
@@ -174,6 +129,7 @@ TEMPLATE = """<!doctype html>
     link only works once.</p>
   </div>
 
+{footer}
 </div>
 <script>
 function copyManifest() {{
@@ -192,7 +148,11 @@ function copyManifest() {{
 
 def render(base_url: str) -> str:
     manifest = json.dumps(build_manifest(base_url), indent=2)
-    return TEMPLATE.format(base_url=html.escape(base_url.rstrip("/")),
+    return TEMPLATE.format(css=web_theme.CSS,
+                           page_css=PAGE_CSS,
+                           brandbar=web_theme.brandbar("slack app"),
+                           footer=web_theme.FOOTER_HTML,
+                           base_url=html.escape(base_url.rstrip("/")),
                            manifest_html=html.escape(manifest))
 
 
