@@ -306,6 +306,21 @@ def test_one_fully_wired_fake_tenant_webhook_to_dashboard(client):
     assert payload_json["digest"]["counts"]["suppressed"] == 1, payload_json["digest"]["counts"]
     assert payload_json["digest"]["counts"]["items_checked"] == 3
 
+    # Milestone 2, Task 6.2: every row carries a `copilot` key (Task 5.1/5.3
+    # — the field exists in the real, live-shaped payload, not just in a
+    # unit test's hand-built dict). No `ARGUS_LLM_API_KEY` is configured
+    # anywhere in this test environment (conftest.py never sets one), so
+    # every value is `None` — the Fail-Safe Fallback Invariant, proven here
+    # across the FULL multi-tenant pipeline (webhook -> ingest -> detect ->
+    # digest -> HTTP), not just inside llm_copilot.py's own unit tests: a
+    # missing LLM credential costs nothing, the rehearsal still completes,
+    # and every alert still renders exactly as it did before this module
+    # existed.
+    for row in payload_json["digest"]["rows"]:
+        assert "copilot" in row, row
+        assert row["copilot"] is None, (
+            "no ARGUS_LLM_API_KEY is configured in tests; copilot must fall back to None")
+
     # 6d. /v1/digests/latest (text): rendered_text present, payload_json
     # genuinely absent — the other half of this session's own dashboard
     # fix, proven the same way over real HTTP.
