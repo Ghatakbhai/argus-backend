@@ -816,7 +816,7 @@ def test_the_generated_setup_page_carries_no_secret():
 
 def test_health_still_reports_a_running_service(client):
     r = client.get("/v1/health")
-    assert r.status_code == 200 and r.json() == {"status": "ok", "phase": "7.4c"}
+    assert r.status_code == 200 and r.json() == {"status": "ok", "phase": "7.5"}
 
 
 def test_with_no_signing_secret_every_slack_request_is_refused(client, monkeypatch):
