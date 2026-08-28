@@ -255,21 +255,26 @@ def run_one(tenant_id: str, tenant_slug: str, run_id: int) -> dict:
         # of that rule. It is also raised for a 'live' tenant with no Slack
         # workspace connected yet, an equally normal mid-onboarding state.
         #
-        # `email_for_login` is left at its default (None), named plainly
-        # rather than faked: nothing in this codebase yet resolves a GitHub
-        # login to an email address (see slack_dispatcher.py's own
-        # docstring on the two things the milestone doc got wrong about
-        # this contract) — every identity will resolve as 'unresolved'
-        # until a real source of truth exists. That is a known, separate
-        # gap, not something this wiring step can close, and leaving it
-        # unresolved rather than inventing one is the same discipline
-        # `readiness.checks_state='unknown'` already holds itself to.
+        # `email_for_login` — Pre-Milestone 2 slice (D-171): no longer left
+        # at its default None. `slack_dispatcher.build_email_resolver()`
+        # closes the gap named here through session 56: a real 3-tier
+        # resolver backed by `tenant_identity_map` (an explicit, human-
+        # confirmed login -> email row) and `tenant.email_domain` (a
+        # per-tenant `{login}@{domain}` heuristic). Built fresh inside the
+        # SAME `tenant_tx` the dispatch call below runs in — it is a closure
+        # over `conn`/`tenant_id`, not a value that could go stale across
+        # transactions. A tenant with neither configured yet behaves exactly
+        # as before this slice (every identity still resolves 'unresolved'),
+        # now recorded as an explicit `suppressed_unresolved_identity`
+        # `triage_message` row rather than silently producing nothing.
         slack_error: str | None = None
         slack_summary = None
         try:
             with db.tenant_tx(tenant_id) as conn:
+                email_resolver = slack_dispatcher.build_email_resolver(conn, tenant_id)
                 slack_summary = slack_dispatcher.dispatch_tenant_triage_dms(
-                    conn, tenant_id, result["ingest_run_id"], now_iso())
+                    conn, tenant_id, result["ingest_run_id"], now_iso(),
+                    email_for_login=email_resolver)
         except slack_dispatcher.TenantNotLive:
             pass
         except Exception as exc:
