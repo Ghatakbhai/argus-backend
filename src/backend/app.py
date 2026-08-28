@@ -27,11 +27,12 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from . import config, db, github_app, ingest_worker, jira_crypto, linear_crypto, slack_app, slack_crypto
+from . import (config, db, github_app, ingest_worker, jira_crypto, linear_crypto,
+               slack_app, slack_crypto, system_health)
 from .auth import TenantContext, generate_key, hash_key, now_iso
 
 
@@ -508,6 +509,7 @@ def list_ingest_runs(t: Tenant, limit: int = 20) -> list[IngestRunOut]:
 @app.get("/v1/alerts", response_model=list[AlertOut])
 def list_alerts(
     t: Tenant,
+    response: Response,
     outcome: Annotated[Literal["FIRE", "SUPPRESSED", "ABSTAIN"] | None, Query()] = None,
     limit: int = 100,
 ) -> list[AlertOut]:
@@ -534,6 +536,13 @@ def list_alerts(
     params.append(limit)
     with db.tenant_tx(t.tenant_id) as conn:
         rows = conn.execute(sql, params).fetchall()
+        # Milestone 1, Task 5.3: an orthogonal tenant-health signal, not a
+        # fourth `outcome` value — see system_health.py's own docstring for
+        # why. A header, not a payload key, because this endpoint's body is
+        # a JSON array: there is no top-level object to hang a scalar field
+        # off without breaking `response_model=list[AlertOut]`.
+        health = system_health.compute_system_health(conn, t.tenant_id, now_iso())
+    response.headers["X-ARGUS-System-Health"] = health.status
     return [AlertOut(**{k: r[k] for k in AlertOut.model_fields if k in r}) for r in rows]
 
 
@@ -570,14 +579,32 @@ def list_digests(t: Tenant, limit: int = 14) -> list[DigestOut]:
 @app.get("/v1/digests/latest")
 def latest_digest(
     t: Tenant,
+    response: Response,
     format: Annotated[Literal["text", "json"] | None, Query()] = None,
 ) -> Any:
     with db.tenant_tx(t.tenant_id) as conn:
         row = conn.execute(
             "SELECT * FROM digest_delivery ORDER BY delivered_at DESC, id DESC LIMIT 1"
         ).fetchone()
-    if row is None:
-        raise HTTPException(404, "No digest yet")
+        if row is None:
+            raise HTTPException(404, "No digest yet")
+        # Milestone 1, Task 5.3. Scoped to the run THIS digest was built
+        # from (`ingest_run_id`), not just "whatever is most recent" — a
+        # lead reading an older digest (`GET /v1/digests` history, or a
+        # slow-to-refresh client) should see the health that digest was
+        # actually assembled under, not today's.
+        health = system_health.compute_system_health(
+            conn, t.tenant_id, now_iso(), run_id=row["ingest_run_id"])
+    # A header, not a payload key, on this endpoint too, and deliberately
+    # NOT merged into the stored `payload_json` dict: system_health is
+    # evaluated fresh on every read (that is the entire point of a
+    # staleness/rate-limit signal), while `payload_json` is a frozen
+    # snapshot of what was rendered at digest-build time — the same
+    # `digest_delivery.payload_json` `test_dashboard_contract.py` asserts
+    # is byte-for-byte what a live GET returns. Folding a live-computed
+    # field into that dict would make the two disagree by design and break
+    # that invariant; the header keeps them separate and both honest.
+    response.headers["X-ARGUS-System-Health"] = health.status
     if format == "json":
         if not row.get("payload_json"):
             raise HTTPException(409, "Digest has no structured payload")
@@ -593,7 +620,9 @@ def latest_digest(
     # entirely, not merely empty. A plain dict, built the same way but
     # excluding that one key, is what actually keeps the key out of the
     # JSON rather than present-and-null.
-    return {k: row[k] for k in DigestOut.model_fields if k in row and k != "payload_json"}
+    out = {k: row[k] for k in DigestOut.model_fields if k in row and k != "payload_json"}
+    out["system_health"] = health.status
+    return out
 
 
 # ============================================================================
