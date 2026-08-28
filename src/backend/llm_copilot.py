@@ -24,7 +24,7 @@ this module exists to hold, in this order of importance:
      in this codebase treats `None` as "render the raw deterministic alert,
      exactly as before this module existed" — never as an error to surface
      to a person.
-  4. **Scope Discipline.** Exactly two features, one combined call: the
+  4. **Scope Discipline.** Two features, one combined call: the
      TL;DR summary (`summary_tldr`/`blocking_dependency`) and the action
      draft (`action_draft`/`suggested_recipient_role`). Combined into one
      prompt/one schema/one API call deliberately — two separate calls per
@@ -32,6 +32,18 @@ this module exists to hold, in this order of importance:
      project's own `PATTERN_HEADLINE`/`PATTERN_ASK` dictionaries already
      show that a single short, structured call is enough for a stall
      pattern's worth of context.
+
+     **Widened once, deliberately, at Phase 7.4X (Task 3):** a THIRD
+     feature, `generate_morning_briefing()`, was added by Dirgh's explicit
+     decision after `docs/PHASE7_4X_CLAUDE_ARCHITECTURE_REVIEW.md` §3 named
+     this exact widening as something that must be decided rather than drift
+     into place. It is a separate call with its own prompt, schema, timeout
+     proof and fallback — it does NOT ride along on the two-feature call
+     above, because a per-item enrichment and a per-digest summary have
+     different inputs and different failure consequences. Section 6 carries
+     the full reasoning. The invariant now reads: three features, two calls,
+     each independently proven to fail closed — and any fourth is another
+     decision, not another accretion.
 
 **Provider: Google Gemini, model `gemini-3.7-flash` — locked in by Dirgh,
 not Claude's own choice (see context/DECISIONS.md D-172).** Verified via
@@ -386,38 +398,14 @@ def _call_gemini(prompt: str, *, api_key: str, timeout: float) -> dict:
     wait_for`). Raises `CopilotUnavailable` on ANY failure — network,
     non-2xx, or a response that doesn't parse as the expected envelope —
     which `generate_enrichment()` below is the only place that catches."""
-    url = GEMINI_ENDPOINT.format(model=GEMINI_MODEL)
-    body = json.dumps({
-        "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": _RESPONSE_SCHEMA,
-            "temperature": 0.2,
-            "maxOutputTokens": 512,
-        },
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key,
-                "User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:500]
-        raise CopilotUnavailable(f"HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise CopilotUnavailable(f"network error: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise CopilotUnavailable(f"timed out after {timeout}s") from exc
-
-    try:
-        envelope = json.loads(raw)
-        text = envelope["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
-    except (KeyError, IndexError, ValueError, TypeError) as exc:
-        raise CopilotUnavailable(f"could not parse Gemini response envelope: {exc}") from exc
+    # Phase 7.4X: the transport itself now lives in `_call_gemini_json`
+    # (section 6), shared with the morning briefing. This function is that
+    # one with the enrichment feature's prompt and schema bound in — so a
+    # future change to timeout handling, error translation or envelope
+    # parsing cannot fix one feature and miss the other.
+    return _call_gemini_json(prompt, system_prompt=_SYSTEM_PROMPT,
+                             schema=_RESPONSE_SCHEMA, api_key=api_key,
+                             timeout=timeout, max_tokens=512)
 
 
 # ===========================================================================
@@ -475,3 +463,280 @@ def generate_enrichment(ctx: CopilotContext, *, timeout: float = DEFAULT_TIMEOUT
                        "%s: %s (falling back to raw alert)",
                        ctx.item_key, time.monotonic() - started, type(exc).__name__, exc)
         return None
+
+
+# ===========================================================================
+# 6. The Executive Morning Briefing — Phase 7.4X, Task 3.
+#
+# THIS IS THE THIRD LLM FEATURE, AND THAT IS A DELIBERATE WIDENING OF THIS
+# MODULE'S OWN SCOPE DISCIPLINE INVARIANT.
+#
+# The docstring at the top of this file says "Exactly two features, one
+# combined call," and `docs/PHASE7_4X_CLAUDE_ARCHITECTURE_REVIEW.md` §3 named
+# this feature specifically as something that "widens an invariant you
+# deliberately wrote narrow one session ago" and should therefore be "a
+# deliberate, named decision rather than something that happens by
+# accretion." Dirgh made that decision (Phase 7.4X kickoff, Task 3). It is
+# named here, at the code, so a future reader does not find a third feature
+# sitting under a docstring that forbids one.
+#
+# What is NOT widened, and is re-proven for this call independently rather
+# than inherited from `generate_enrichment`:
+#
+#   * The 3-second ceiling. Its own `urlopen(timeout=...)`, its own tests.
+#   * The Fail-Safe Fallback. Stricter here than for enrichment, in fact:
+#     `generate_enrichment` returns None and the caller renders the raw
+#     alert, but a briefing has no raw form to fall back to, so this function
+#     ALWAYS returns a valid, schema-shaped dict — the deterministic one when
+#     the model is unavailable for any reason.
+#   * The Trigger Invariant. This reads a digest that `sprint_filter.py` has
+#     already decided in full. It cannot promote, demote, or silence a row.
+#   * Redaction. Every string reaching the prompt goes through `redact()`.
+#
+# WHY `healthy_count` IS NEVER THE MODEL'S ANSWER
+# -----------------------------------------------
+# It is in the response schema because Task 3.2 puts it there, and the model
+# is asked for it so the schema the API validates against matches the
+# document. The value RETURNED, though, is always the one computed here from
+# the counts the engine produced. A language model is the wrong instrument
+# for arithmetic anyone can check, and this project has spent five phases on
+# the principle that a number in front of a human should be traceable to a
+# row. A disagreement between the two is logged, not silently preferred
+# either way.
+# ===========================================================================
+
+# digest.py's SECTION_TONE marks exactly these two sections 'urgent'. Named
+# as a literal here rather than imported: this module deliberately depends on
+# nothing but `config` (see the import block above), and pulling `digest` —
+# which itself pulls `presence`, `slack_triage` and `sprint_filter` — into a
+# backend module for two strings would be a much bigger coupling than the
+# duplication costs. If digest.py's tone map ever changes, this is the line
+# that has to change with it.
+CRITICAL_SECTIONS = ("blocked", "escalation")
+
+_BRIEFING_SYSTEM_PROMPT = """You are writing the first thing an engineering \
+lead reads in the morning. A deterministic rule engine has already decided \
+which items are stuck and why — you are never asked to re-judge that, only to \
+say plainly what today looks like. One short paragraph, at most four \
+sentences, no preamble, no headings, no bullet characters. Name situations, \
+never blame people. If the day is quiet, say so in one sentence rather than \
+inflating it. critical_blocks and friction_items must each be short phrases \
+drawn only from the items listed — never invented, never more than five \
+entries."""
+
+_BRIEFING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "briefing_summary": {
+            "type": "string",
+            "description": "One paragraph, at most four sentences, on the state "
+                           "of the team's in-flight work this morning.",
+        },
+        "critical_blocks": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Short phrases naming the items that need a decision "
+                           "today. At most 5. Drawn only from the items given.",
+        },
+        "friction_items": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Short phrases naming slow-but-not-critical items. "
+                           "At most 5. Drawn only from the items given.",
+        },
+        "healthy_count": {
+            "type": "integer",
+            "description": "How many checked items are not flagged at all.",
+        },
+    },
+    "required": ["briefing_summary", "critical_blocks", "friction_items", "healthy_count"],
+}
+
+_MAX_BRIEFING_ROWS = 25     # a prompt cost ceiling, not a product rule
+_MAX_LIST_ENTRIES = 5
+
+
+def _briefing_counts(active_rows: list, stats: Optional[dict]) -> tuple:
+    """(critical_count, total_count, healthy_count) — all three deterministic.
+
+    `total_count` is the number of flagged rows in front of the lead, not
+    `items_checked`: "12 items in-flight" meaning "we looked at 12" would be
+    read by every human as "12 things are wrong", and the fallback line is
+    the one that renders when nothing else can.
+    """
+    stats = stats or {}
+    critical = sum(1 for r in active_rows if (r or {}).get("section") in CRITICAL_SECTIONS)
+    total = len(active_rows)
+    checked = stats.get("items_checked")
+    healthy = max(int(checked) - total, 0) if isinstance(checked, int) else 0
+    return critical, total, healthy
+
+
+def _fallback_briefing(active_rows: list, stats: Optional[dict]) -> dict:
+    """Task 3.3's deterministic summary. Not an error state and never
+    rendered as one: this is what the dashboard shows whenever no API key is
+    configured, which is the ordinary, supported way to run ARGUS."""
+    critical, total, healthy = _briefing_counts(active_rows, stats)
+    return {
+        "briefing_summary": f"{critical} critical blocks, {total} items in-flight",
+        "critical_blocks": [r["item_key"] for r in active_rows
+                            if (r or {}).get("section") in CRITICAL_SECTIONS
+                            and r.get("item_key")][:_MAX_LIST_ENTRIES],
+        "friction_items": [r["item_key"] for r in active_rows
+                           if (r or {}).get("section") not in CRITICAL_SECTIONS
+                           and r.get("item_key")][:_MAX_LIST_ENTRIES],
+        "healthy_count": healthy,
+        "source": "deterministic",
+    }
+
+
+def _build_briefing_prompt(active_rows: list, stats: Optional[dict]) -> str:
+    critical, total, healthy = _briefing_counts(active_rows, stats)
+    lines = [
+        f"Flagged items this morning: {total} ({critical} in an urgent section). "
+        f"Items checked and not flagged: {healthy}.",
+        "",
+        "The flagged items, one per line:",
+    ]
+    if not active_rows:
+        lines.append("  (none — nothing was flagged this morning)")
+    for r in active_rows[:_MAX_BRIEFING_ROWS]:
+        r = r or {}
+        bits = [str(r.get("item_key") or "unknown item")]
+        if r.get("section"):
+            bits.append(f"[{r['section']}]")
+        if r.get("age_label"):
+            bits.append(f"({r['age_label']} old)")
+        headline = redact(r.get("headline") or r.get("title") or "")
+        if headline:
+            bits.append(f"— {headline}")
+        lines.append("  " + " ".join(bits))
+    return "\n".join(lines)
+
+
+def _call_gemini_json(prompt: str, *, system_prompt: str, schema: dict,
+                      api_key: str, timeout: float, max_tokens: int = 512) -> dict:
+    """`_call_gemini`'s body, with the prompt/schema lifted out as arguments
+    so the two features share one transport, one set of error translations
+    and one timeout mechanism rather than growing a second copy that could
+    drift. `_call_gemini` below is now this function with the enrichment
+    feature's own prompt and schema bound in."""
+    url = GEMINI_ENDPOINT.format(model=GEMINI_MODEL)
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "temperature": 0.2,
+            "maxOutputTokens": max_tokens,
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key,
+                 "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise CopilotUnavailable(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise CopilotUnavailable(f"network error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise CopilotUnavailable(f"timed out after {timeout}s") from exc
+
+    try:
+        envelope = json.loads(raw)
+        text = envelope["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except (KeyError, IndexError, ValueError, TypeError) as exc:
+        raise CopilotUnavailable(f"could not parse Gemini response envelope: {exc}") from exc
+
+
+def _validate_briefing(data: dict, *, healthy_count: int, item_key: str) -> dict:
+    """Task 3.2's schema contract, enforced on our side of the wire.
+
+    `responseSchema` is a request to the API, not a guarantee about what
+    comes back — the same reason `_validate_schema` exists for the enrichment
+    feature. Every field is re-checked here."""
+    if not isinstance(data, dict):
+        raise CopilotUnavailable(f"briefing was not a JSON object: {type(data).__name__}")
+    summary = data.get("briefing_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise CopilotUnavailable("missing/empty briefing_summary")
+
+    def _string_list(name: str) -> list:
+        val = data.get(name)
+        if val is None:
+            return []
+        if not isinstance(val, list):
+            raise CopilotUnavailable(f"{name} was present but not a list")
+        out = [v.strip() for v in val if isinstance(v, str) and v.strip()]
+        return out[:_MAX_LIST_ENTRIES]
+
+    model_healthy = data.get("healthy_count")
+    if isinstance(model_healthy, int) and model_healthy != healthy_count:
+        # Logged, not obeyed and not silently dropped — see this section's
+        # header for why the deterministic figure wins.
+        logger.warning("llm_copilot: briefing for %s returned healthy_count=%s; "
+                       "using the engine's own %s instead",
+                       item_key, model_healthy, healthy_count)
+    return {
+        "briefing_summary": summary.strip(),
+        "critical_blocks": _string_list("critical_blocks"),
+        "friction_items": _string_list("friction_items"),
+        "healthy_count": healthy_count,
+        "source": "llm",
+    }
+
+
+def generate_morning_briefing(tenant_id, active_rows: Optional[list] = None,
+                              stats: Optional[dict] = None, *,
+                              timeout: float = DEFAULT_TIMEOUT_SECONDS,
+                              provider: Optional[str] = None,
+                              api_key: Optional[str] = None) -> dict:
+    """Phase 7.4X Task 3.1: the 10-second executive standup briefing.
+
+    ALWAYS returns a dict carrying all four of Task 3.2's fields plus a
+    `source` key (`"llm"` or `"deterministic"`) saying which path produced
+    it. Never returns None, never raises — a lead opening the dashboard must
+    see a briefing whether or not a language model was reachable, and a
+    dashboard that can tell the two apart is a dashboard that cannot quietly
+    present a canned count as a written summary.
+
+    `tenant_id` is used for logging only. It is deliberately NOT sent to the
+    model: it identifies a paying customer and adds nothing to a summary of
+    their own items.
+    """
+    active_rows = list(active_rows or [])
+    provider = provider or config.LLM_PROVIDER
+    api_key = api_key if api_key is not None else config.LLM_API_KEY
+    label = f"tenant {tenant_id}"
+
+    if not api_key:
+        logger.info("llm_copilot: no ARGUS_LLM_API_KEY configured; %s gets the "
+                    "deterministic morning briefing", label)
+        return _fallback_briefing(active_rows, stats)
+    if provider != "google":
+        logger.warning("llm_copilot: unrecognized ARGUS_LLM_PROVIDER %r for %s; "
+                       "deterministic morning briefing", provider, label)
+        return _fallback_briefing(active_rows, stats)
+
+    _c, _t, healthy = _briefing_counts(active_rows, stats)
+    started = time.monotonic()
+    try:
+        raw = _call_gemini_json(
+            _build_briefing_prompt(active_rows, stats),
+            system_prompt=_BRIEFING_SYSTEM_PROMPT, schema=_BRIEFING_SCHEMA,
+            api_key=api_key, timeout=timeout, max_tokens=768)
+        return _validate_briefing(raw, healthy_count=healthy, item_key=label)
+    except CopilotUnavailable as exc:
+        logger.warning("llm_copilot: morning briefing failed for %s after %.2fs: %s "
+                       "(falling back to the deterministic summary)",
+                       label, time.monotonic() - started, exc)
+        return _fallback_briefing(active_rows, stats)
+    except Exception as exc:  # noqa: BLE001 — same absolute rule as above.
+        logger.warning("llm_copilot: unexpected error building the morning briefing "
+                       "for %s after %.2fs: %s: %s (falling back)",
+                       label, time.monotonic() - started, type(exc).__name__, exc)
+        return _fallback_briefing(active_rows, stats)
