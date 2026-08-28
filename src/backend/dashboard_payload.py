@@ -423,9 +423,25 @@ def build_dashboard_payload(
     digest_dict = dig.as_dict()
     digest_dict["rows"] = row_dicts  # the enriched rows, not dig.as_dict()'s bare ones
 
+    # Phase 7.4X, Task 3.4. Built from the rows a lead is actually shown
+    # (`row_dicts`), not from the raw result list, so the briefing and the
+    # board underneath it can never describe different mornings. One call per
+    # digest build — the same "computed once, persisted into payload_json"
+    # caching the per-row copilot already uses; a dashboard refresh re-reads
+    # it, it does not re-ask the model.
+    #
+    # `generate_morning_briefing` never returns None and never raises, so
+    # this key is always present and always renderable. Its own `source`
+    # field says whether a model wrote it or the deterministic fallback did
+    # — the dashboard must be able to tell those apart, since one is a
+    # written summary and the other is a count wearing a sentence.
+    morning_briefing = llm_copilot.generate_morning_briefing(
+        tenant_slug, row_dicts, digest_dict.get("counts"))
+
     return {
-        "contract_version": "7.4d",
+        "contract_version": "7.4x",
         "generated_by": "src/backend/dashboard_payload.py",
+        "morning_briefing": morning_briefing,
         "tenant": {
             "slug": tenant_slug, "label": team_label,
             "members": tenant_members, "shadow_until": shadow_until,
