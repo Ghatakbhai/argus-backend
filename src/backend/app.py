@@ -246,14 +246,14 @@ async def lifespan(app: FastAPI):
     db.close_pools()
 
 
-app = FastAPI(title="ARGUS", version="7.4c", lifespan=lifespan)
+app = FastAPI(title="ARGUS", version="7.5", lifespan=lifespan)
 
 
 @app.get("/v1/health")
 def health() -> dict[str, Any]:
     with db.unbound_app_tx() as conn:
         conn.execute("SELECT 1")
-    return {"status": "ok", "phase": "7.4d"}
+    return {"status": "ok", "phase": "7.5"}
 
 
 # --- control plane ---------------------------------------------------------
