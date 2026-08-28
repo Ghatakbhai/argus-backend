@@ -253,7 +253,7 @@ app = FastAPI(title="ARGUS", version="7.4c", lifespan=lifespan)
 def health() -> dict[str, Any]:
     with db.unbound_app_tx() as conn:
         conn.execute("SELECT 1")
-    return {"status": "ok", "phase": "7.4c"}
+    return {"status": "ok", "phase": "7.4d"}
 
 
 # --- control plane ---------------------------------------------------------
