@@ -103,6 +103,15 @@ SLACK_TOKEN_KEY = os.environ.get("ARGUS_SLACK_TOKEN_KEY")
 # would each silently break the exchange).
 PUBLIC_BASE_URL = os.environ.get("ARGUS_PUBLIC_BASE_URL", "").rstrip("/")
 
+# Where the Phase 7.4 Standup Radar console is served from, so the install and
+# OAuth pages can offer an `[Open Standup Radar]` button instead of leaving a
+# pilot contact on a dead-end success screen with nowhere to go next. The
+# console is a static single file (`src/dashboard/index.html`) that this
+# service does not host, so its URL genuinely cannot be derived from
+# PUBLIC_BASE_URL and has to be told. Unset is a supported state: every page
+# that offers the button simply omits it rather than linking somewhere wrong.
+DASHBOARD_URL = os.environ.get("ARGUS_DASHBOARD_URL", "").rstrip("/")
+
 # Every scope the pilot needs, requested once at install.
 #
 # 6.5 took the opposite approach deliberately — request only what the current
