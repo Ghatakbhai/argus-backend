@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import time
 import urllib.parse
@@ -32,8 +33,40 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import (config, db, github_app, ingest_worker, jira_crypto, linear_crypto,
-               slack_app, slack_crypto, system_health)
+               slack_app, slack_crypto, system_health, web_theme)
 from .auth import TenantContext, generate_key, hash_key, now_iso
+
+
+# --------------------------------------------------------------------------
+# The pages a human sees mid-install.
+#
+# Five of the endpoints below answer a BROWSER, not an API client: GitHub's
+# manifest callback, GitHub's post-install redirect, and Slack's install /
+# OAuth pair. Everything else in this file returns JSON to something holding
+# an API key. Those five used to return bare `<h1>`/`<p>` on the browser's
+# default white — which meant a pilot team's very first sight of ARGUS looked
+# nothing like the console they were about to open.
+#
+# `web_theme` is the one stylesheet all of it now shares (see that module's
+# docstring). These two helpers are the only thing this file needs from it:
+# `_page` for the one page with a table on it, `_status` for the eight
+# one-card outcome screens.
+# --------------------------------------------------------------------------
+
+
+def _install_actions(*, slack: bool = False) -> str:
+    """The action row at the bottom of a success page. Each button appears
+    only if the URL it needs is actually configured — an `[Open Standup
+    Radar]` button pointing nowhere is worse than no button."""
+    return (web_theme.action_button("Open Standup Radar", config.DASHBOARD_URL, primary=True)
+            + (web_theme.action_button("Return to Slack", "slack://open") if slack else ""))
+
+
+def _status(kind: str, title: str, body: str, status_code: int = 200, *,
+            pill: str | None = None, actions: str = "", detail: str = "") -> HTMLResponse:
+    return HTMLResponse(
+        web_theme.status_page(kind, title, body, pill=pill, actions=actions, detail=detail),
+        status_code=status_code)
 
 
 # --------------------------------------------------------------------------
@@ -659,10 +692,12 @@ def github_manifest_callback(code: str, state: str | None = None) -> HTMLRespons
     if state != config.GITHUB_SETUP_SECRET:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Bad setup state")
     if config.GITHUB_APP_ID:
-        return HTMLResponse(
-            "<h1>Already configured</h1><p>ARGUS_GITHUB_APP_ID is already set on this "
-            "deployment. Unset it (and restart) first if you meant to create a "
-            "brand-new App.</p>", status_code=409)
+        return _status(
+            "warn", "Already configured",
+            "<p>An App ID is already set on this deployment. Unset "
+            "<code>ARGUS_GITHUB_APP_ID</code> and restart first if you meant to create a "
+            "brand-new App.</p>",
+            409, pill="Already set up")
     creds = github_app.exchange_manifest_code(code)
     # Displayed once, never written to disk here: the human copies these into
     # this host's own environment variables and restarts the service, the
@@ -676,17 +711,24 @@ def github_manifest_callback(code: str, state: str | None = None) -> HTMLRespons
         ("ARGUS_GITHUB_APP_PRIVATE_KEY", creds["pem"]),
     ]
     rows = "".join(
-        f"<tr><td><code>{k}</code></td><td>"
-        f"<textarea readonly rows=3 style='width:100%;font-family:monospace'>{v}</textarea>"
-        f"</td></tr>" for k, v in fields
+        f'<tr><td class="k"><code>{k}</code></td>'
+        f'<td><textarea readonly rows=3 spellcheck="false">{v}</textarea></td></tr>'
+        for k, v in fields
     )
-    return HTMLResponse(
-        "<h1>&#9989; ARGUS Stall Radar App created</h1>"
+    body = (
+        '<div class="card card--ok">'
+        '<span class="badge badge-ok"><span class="dot"></span>App created</span>'
+        '<h1 style="margin-top:var(--s3)">ARGUS Stall Radar App created</h1>'
         "<p>Copy each value below into this host's environment variables, then "
-        "restart the service. This page will not show these again — if you lose "
+        "restart the service. This page will not show these again &mdash; if you lose "
         "them, delete the App on GitHub and run the manifest flow again.</p>"
-        f"<table border=1 cellpadding=6>{rows}</table>"
+        '<div class="warn"><b>Shown once.</b> Nothing on this page is written to disk by '
+        "ARGUS; the private key in particular exists here and nowhere else.</div>"
+        f"<h2>Environment variables</h2><table>{rows}</table>"
+        "</div>"
     )
+    return HTMLResponse(web_theme.document("ARGUS Stall Radar App created", body,
+                                           tag="setup", wide=True))
 
 
 @app.get("/v1/github/setup", response_class=HTMLResponse)
@@ -701,10 +743,11 @@ def github_setup(
     tenant, since nothing else in this request can be trusted to name one.
     """
     if not state:
-        return HTMLResponse(
-            "<h1>Missing setup token</h1><p>This install link is missing its one-time "
-            "token. Ask for a fresh install link rather than reusing an old one.</p>",
-            status_code=400)
+        return _status(
+            "urgent", "Missing setup token",
+            "<p>This install link is missing its one-time token. Ask for a fresh install "
+            "link rather than reusing an old one &mdash; nothing has been connected.</p>",
+            400, pill="Link incomplete")
     token_hash = github_app.hash_claim_token(state)
     at = now_iso()
     with db.unbound_app_tx() as conn:
@@ -713,13 +756,18 @@ def github_setup(
             (token_hash, installation_id, "", "", "", at),
         ).fetchone()
     if row is None:
-        return HTMLResponse(
-            "<h1>This install link is invalid or has expired.</h1>"
-            "<p>Install links are single-use. Ask for a fresh one.</p>", status_code=400)
-    return HTMLResponse(
-        "<h1>&#9989; ARGUS is now connected</h1>"
-        "<p>You can close this tab — ARGUS will start watching the "
-        f"repositories you selected. (setup_action: {setup_action})</p>")
+        return _status(
+            "urgent", "This install link is invalid or has expired.",
+            "<p>Install links are single-use and time-limited. Ask for a fresh one and "
+            "click that one instead.</p>",
+            400, pill="Link expired")
+    return _status(
+        "ok", "ARGUS is now connected",
+        "<p>You can close this tab &mdash; ARGUS will start watching the repositories "
+        "you selected. Nothing is sent to anyone until your team goes live.</p>",
+        pill="Connected",
+        detail=f"setup_action: {html.escape(setup_action)}",
+        actions=_install_actions())
 
 
 @app.post("/v1/admin/tenants/{slug}/github/install-link", response_model=InstallLinkOut,
@@ -921,17 +969,30 @@ async def github_webhook(request: Request) -> dict[str, Any]:
 # ============================================================================
 
 
-def _slack_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
+def _slack_page(title: str, body: str, status_code: int = 200, *, kind: str = "",
+                pill: str | None = None, actions: str = "",
+                detail: str = "") -> HTMLResponse:
     """One place that decides what a pilot contact sees mid-install.
 
     These pages are read by a non-technical person in the middle of setting
     ARGUS up for their team. Every one of them says what happened and what to
     do next, and none of them shows a stack trace, an internal id, or another
-    tenant's name.
+    tenant's name. That contract is unchanged; what changed is that they now
+    render through `web_theme` in the console's own dark palette, so the tab a
+    pilot contact lands on after clicking "Add to Slack" looks like the
+    product rather than an unstyled browser default.
+
+    `kind` is inferred from the status code when not given, because every
+    existing call site already encodes the outcome there: 2xx is a success
+    card, 4xx is the red one, 5xx the amber "not configured yet" one. Callers
+    that want a different accent (a 409 that is really a warning, say) pass
+    `kind` explicitly.
     """
+    if not kind:
+        kind = "ok" if status_code < 400 else ("urgent" if status_code < 500 else "warn")
     return HTMLResponse(
-        f"<h1>{title}</h1><p>{body}</p>"
-        "<p style='color:#666;font-size:90%'>ARGUS &mdash; engineering stall radar</p>",
+        web_theme.status_page(kind, title, f"<p>{body}</p>", pill=pill,
+                              actions=actions, detail=detail),
         status_code=status_code)
 
 
@@ -1030,7 +1091,8 @@ def slack_install(state: str):
     if not (config.SLACK_CLIENT_ID and config.PUBLIC_BASE_URL):
         return _slack_page("Slack install is not configured yet",
                            "This ARGUS deployment has no Slack app credentials set. "
-                           "Nothing was sent to Slack.", 503)
+                           "Nothing was sent to Slack.", 503,
+                           pill="Not configured")
     with db.unbound_app_tx() as conn:
         tenant_id = conn.execute("SELECT argus_install_claim_tenant(%s,%s,%s) AS t",
                                  (slack_app.hash_claim_token(state), "slack",
@@ -1040,7 +1102,7 @@ def slack_install(state: str):
             "This install link is invalid or has expired",
             "Install links are single-use and time-limited. Nothing has been changed in "
             "your Slack workspace &mdash; ask for a fresh link and click that one instead.",
-            400)
+            400, pill="Link expired")
     return RedirectResponse(slack_app.oauth_authorize_url(state), status_code=302)
 
 
@@ -1056,25 +1118,31 @@ def slack_oauth_callback(code: str | None = None, state: str | None = None,
     """
     if error:
         return _slack_page("Install cancelled",
-                           f"Slack reported: <code>{error}</code>. Nothing was connected. "
-                           "You can click your install link again whenever you're ready.", 400)
+                           "Nothing was connected. You can click your install link again "
+                           "whenever you're ready.", 400, kind="muted",
+                           pill="Cancelled",
+                           detail=f"Slack reported: {html.escape(error)}")
     if not code or not state:
         return _slack_page("Incomplete Slack response",
                            "Slack's redirect was missing its authorisation code. "
-                           "Please start again from your install link.", 400)
+                           "Please start again from your install link.", 400,
+                           pill="Incomplete")
     if not config.SLACK_TOKEN_KEY:
         # Refusing here rather than storing a live bot token in the clear.
         return _slack_page("Slack install is not configured yet",
                            "This ARGUS deployment cannot store workspace credentials "
-                           "securely yet. Nothing was connected.", 503)
+                           "securely yet. Nothing was connected.", 503,
+                           pill="Not configured")
     try:
         install = slack_app.exchange_oauth_code(code)
     except slack_app.SlackError as exc:
         return _slack_page("Slack refused the install",
-                           f"Slack reported: <code>{exc.error}</code>. Nothing was "
-                           "connected. Ask for a fresh install link and try again.", 400)
+                           "Nothing was connected. Ask for a fresh install link and try "
+                           "again.", 400, pill="Refused",
+                           detail=f"Slack reported: {html.escape(exc.error)}")
     except slack_app.SlackNotConfigured as exc:
-        return _slack_page("Slack install is not configured yet", str(exc), 503)
+        return _slack_page("Slack install is not configured yet", html.escape(str(exc)),
+                           503, pill="Not configured")
 
     at = now_iso()
     token_hash = slack_app.hash_claim_token(state)
@@ -1092,7 +1160,7 @@ def slack_oauth_callback(code: str | None = None, state: str | None = None,
         return _slack_page(
             "This install link is invalid or has expired",
             "Install links are single-use. Ask for a fresh one &mdash; nothing has been "
-            "connected.", 400)
+            "connected.", 400, pill="Link expired")
     tenant_id = str(tenant_id)
     ciphertext = slack_crypto.encrypt_token(install.access_token, tenant_id)
 
@@ -1106,20 +1174,22 @@ def slack_oauth_callback(code: str | None = None, state: str | None = None,
             return _slack_page(
                 "This install link is invalid or has expired",
                 "Install links are single-use. Ask for a fresh one &mdash; nothing has "
-                "been connected.", 400)
+                "been connected.", 400, pill="Link expired")
         if row["out_status"] == "team_taken":
             return _slack_page(
                 "This Slack workspace is already connected to ARGUS",
                 "A workspace can be connected to one ARGUS team at a time. Remove the "
                 "existing ARGUS app from this workspace first, then use your install "
-                "link again.", 409)
+                "link again.", 409, kind="warn", pill="Already connected")
         _audit(conn, tenant_id, f"slack:{install.team_id}", "slack.install", "ok",
                install.team_name or install.team_id)
     return _slack_page(
-        "&#9989; ARGUS is now connected to Slack",
-        f"Workspace <b>{install.team_name or install.team_id}</b> is connected. You can "
-        "close this tab. ARGUS will only ever send direct messages about work it has "
-        "flagged &mdash; it cannot read your channels or your message history.")
+        "ARGUS is now connected to Slack",
+        f"Workspace <b>{html.escape(install.team_name or install.team_id)}</b> is "
+        "connected. You can close this tab. ARGUS will only ever send direct messages "
+        "about work it has flagged &mdash; it cannot read your channels or your message "
+        "history.",
+        pill="Connected", actions=_install_actions(slack=True))
 
 
 @app.post("/v1/slack/events")
