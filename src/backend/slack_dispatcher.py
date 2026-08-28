@@ -69,6 +69,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
 from . import db, slack_app
@@ -83,14 +84,58 @@ from .slack_app import (
 
 logger = logging.getLogger("argus.slack_dispatcher")
 
+# Phase 7.4X (Tasks 1.3 / 2.3) added P3 and P4 here.
+#
+# `docs/PHASE7_4X_EXECUTION_PLAN.md` §1.3 asks for `PATTERN_HEADLINE["P3"]` in
+# `src/digest.py`. There is no `PATTERN_HEADLINE` in `digest.py` and never has
+# been — the dictionary lives here and in `src/slack_triage.py`, and
+# `digest.py` builds its own section headlines from the row's own facts
+# instead. The plan is corrected rather than a second, competing headline
+# vocabulary introduced into a third module; both real copies are updated
+# together so a P3/P4 alert never renders as the generic "This item looks
+# stuck" in one channel and correctly in the other.
+#
+# The plan's own P3 wording ("Ghost State: PR merged on GitHub but ticket
+# still active in {source}") describes Case A only. P3 has two cases and the
+# other one is the reverse drift, so the headline here names the condition
+# both share; which case fired, with the ticket key and the source's own
+# status word, is in `sprint_filter`'s evidence line, shown verbatim
+# underneath it.
 PATTERN_HEADLINE = {
     "P1-approved-unmerged": "This PR is approved and still unmerged",
     "P2-review-ghosted": "This PR is waiting on your review",
+    "P3-ghost-state": "GitHub and the ticket board disagree about this",
+    "P4-reviewer-ooo-sprint-end": "Your reviewer is away and the cycle is closing",
 }
 PATTERN_ASK = {
     "P1-approved-unmerged": "It has an approval — is something holding the merge?",
     "P2-review-ghosted": "A review was requested and there has been no response yet.",
+    "P3-ghost-state": "One of the two records is out of date — worth a look at which.",
+    "P4-reviewer-ooo-sprint-end": "Nobody has been asked to cover the review yet.",
 }
+
+# The badge line at the top of every triage DM, and the direct Block Kit
+# equivalent of the console's `.badge` pill (docs/DESIGN_SYSTEM.md §3C).
+#
+# Slack has no CSS, so "the same design system" cannot mean the same tokens
+# here — it means the same INFORMATION HIERARCHY, which is the thing a design
+# system actually buys. A radar card in `src/dashboard/index.html` reads, top
+# to bottom: severity pill, then title, then the AI summary set apart from it,
+# then the evidence in muted small text, then the actions. This module now
+# builds exactly that order, using the only four tools Block Kit gives for
+# hierarchy — a coloured emoji as the pill, `*bold*` as the title, `>` as the
+# quote block, and a `context` block as muted small text.
+#
+# The severity emoji is deliberately only ever one of these three, matching
+# the console's urgent / warn / info accents. Adding a fourth colour here
+# would be inventing a status the dashboard cannot show.
+PATTERN_BADGE = {
+    "P1-approved-unmerged": ("\U0001f534", "Stall detected"),
+    "P2-review-ghosted": ("\U0001f534", "Review ghosted"),
+    "P3-ghost-state": ("\U0001f7e1", "State mismatch"),
+    "P4-reviewer-ooo-sprint-end": ("\U0001f7e1", "Reviewer away"),
+}
+DEFAULT_BADGE = ("\U0001f535", "Needs a look")
 
 
 class TenantNotLive(RuntimeError):
@@ -318,11 +363,133 @@ def _button_value(alert_row: dict, copilot: Optional[dict] = None) -> str:
     return json.dumps(value, separators=(",", ":"))[:2000]
 
 
+def _hours_between(earlier: Optional[str], later: str) -> Optional[int]:
+    """Whole hours between two ARGUS timestamps, or None if either is unusable.
+
+    Never raises. Every caller here is decorating a message that must go out
+    regardless — a malformed `source_updated_at` costs the reader one context
+    field, not the alert.
+    """
+    if not earlier or not later:
+        return None
+    try:
+        a = datetime.fromisoformat(earlier.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(later.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return max(0, int((b - a).total_seconds() // 3600))
+
+
+def collect_status_facts(conn, work_item_id: Optional[int], now: str) -> dict:
+    """The handful of numbers the console shows beside a radar row, for the DM.
+
+    The dashboard's row carries an idle time, a state, and how close the cycle
+    is to closing; a triage DM historically carried none of them, which is
+    what made the two surfaces feel like different products even when they
+    were describing the same alert. This reads them from the tenant's own
+    tables — the same `work_item` and `milestone` rows `dashboard_payload`
+    reads — so the DM and the console cannot disagree.
+
+    Every field is optional and every failure is silent by design: this is
+    decoration on a message whose substance (headline, evidence, buttons) is
+    already decided. A tenant with no milestones, or an adapter that never
+    filled `source_updated_at`, simply gets a shorter context line.
+    """
+    if work_item_id is None:
+        return {}
+    try:
+        row = conn.execute(
+            "SELECT w.state, w.is_draft, w.created_at, w.source_updated_at,"
+            "       p.source_key AS repo, m.title AS milestone_title, m.due_on"
+            "  FROM work_item w"
+            "  JOIN project p ON p.id = w.project_id AND p.tenant_id = w.tenant_id"
+            "  LEFT JOIN milestone m ON m.id = w.milestone_id AND m.tenant_id = w.tenant_id"
+            " WHERE w.id = %s", (work_item_id,)).fetchone()
+    except Exception as exc:                      # pragma: no cover - defensive
+        logger.warning("slack_dispatcher: could not read status facts for work_item %s: %s",
+                       work_item_id, exc)
+        return {}
+    if row is None:
+        return {}
+    facts: dict = {"repo": row.get("repo"), "state": row.get("state")}
+    idle = _hours_between(row.get("source_updated_at") or row.get("created_at"), now)
+    if idle is not None:
+        facts["idle_hours"] = idle
+    if row.get("milestone_title"):
+        facts["milestone"] = row["milestone_title"]
+    if row.get("due_on"):
+        due = _hours_between(now, row["due_on"])
+        if due is not None:
+            facts["milestone_days_left"] = due // 24
+    return facts
+
+
+def _context_fields(alert_row: dict, facts: Optional[dict],
+                    copilot: Optional[dict]) -> list[str]:
+    """The muted status row: idle time, reviewer/blocker, cycle deadline.
+
+    Mirrors the console's own per-row metadata strip and, like it, prints
+    nothing for a fact it does not have rather than a placeholder — an
+    "Idle: unknown" field is worse than no field, because a reader who sees
+    three fields on one alert and two on the next correctly infers that the
+    third was not knowable, while "unknown" reads as a bug.
+    """
+    facts = facts or {}
+    out: list[str] = []
+    idle = facts.get("idle_hours")
+    if idle is not None:
+        out.append(f"*Idle* {idle}h" if idle < 72 else f"*Idle* {idle // 24}d")
+    if facts.get("state") == "open" and alert_row.get("pattern") == "P1-approved-unmerged":
+        out.append("*Reviewer* approved")
+    elif alert_row.get("pattern") == "P2-review-ghosted":
+        out.append("*Reviewer* no response yet")
+    elif alert_row.get("pattern") == "P4-reviewer-ooo-sprint-end":
+        out.append("*Reviewer* away")
+    if copilot and copilot.get("blocking_dependency"):
+        out.append(f"*Blocked on* {copilot['blocking_dependency']}")
+    days = facts.get("milestone_days_left")
+    if facts.get("milestone") and days is not None:
+        when = "closes today" if days <= 0 else f"closes in {days}d"
+        out.append(f"*{facts['milestone']}* {when}")
+    elif facts.get("milestone"):
+        out.append(f"*Milestone* {facts['milestone']}")
+    return out
+
+
 def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str],
-                   copilot: Optional[dict] = None) -> list[dict]:
+                   copilot: Optional[dict] = None,
+                   facts: Optional[dict] = None) -> list[dict]:
     """The Block Kit body of one triage DM. Same three-second-read shape as
     `slack_triage.compose_blocks`: what, why, three buttons — using the
     action ids `slack_app.handle_interaction` already recognises.
+
+    THE LAYOUT, and why it is this and not something prettier. Slack gives no
+    control over colour, spacing, or type, so matching `docs/DESIGN_SYSTEM.md`
+    here can only mean matching the console's INFORMATION HIERARCHY. Top to
+    bottom, this is the same order `src/dashboard/index.html` draws a radar
+    card in:
+
+        context   🔴 Stall detected · `owner/repo#142` · argus-backend
+        section   *This PR is approved and still unmerged*
+                  <link|owner/repo#142>
+        section   > 📝 *AI summary:* …                     (only when cached)
+        section   It has an approval — is something holding the merge?
+        context   *Idle* 52h · *Reviewer* approved · *Sprint 14* closes in 2d
+        context   _approved 52h ago, no merge_             (evidence, verbatim)
+        divider
+        actions   [✅ Handled offline] [⏰ Snooze 7d] [🚫 Blocked on…]
+
+    The SECTION COUNT IS LOAD-BEARING and deliberately unchanged: title and
+    ask, plus the TL;DR when there is one. `test_slack_dispatcher.py::
+    test_no_cached_copilot_renders_exactly_as_before` pins it at two, as the
+    Fail-Safe Fallback Invariant's proof that a tenant with no LLM enrichment
+    gets the pre-Milestone-2 message. Everything added above is a `context` or
+    `divider` block precisely so that proof keeps working — new decoration
+    must not be able to masquerade as new substance.
 
     `copilot`, if given (Milestone 2, Task 5.2), is the enrichment dict
     already computed and cached at ingest time — see `llm_copilot.py` and
@@ -332,19 +499,46 @@ def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str],
     line, and never replaces that line — the deterministic evidence stays
     the thing a person can argue with; the summary is additive framing on
     top of it, matching the Copilot Invariant (LLM strictly downstream,
-    never the reason an alert fired)."""
+    never the reason an alert fired). It is now rendered as a Slack quote
+    block with an explicit `📝 AI summary:` label, so a reader can tell at a
+    glance which line a model wrote and which lines the detectors did — the
+    same separation the console draws by putting the summary in its own
+    tinted panel.
+
+    `facts`, if given, is `collect_status_facts()`'s output. Absent, the
+    status context line is simply omitted.
+    """
     headline = PATTERN_HEADLINE.get(alert_row["pattern"] or "", "This item looks stuck")
     ask = PATTERN_ASK.get(alert_row["pattern"] or "", "")
+    emoji, badge_label = PATTERN_BADGE.get(alert_row["pattern"] or "", DEFAULT_BADGE)
     title = f"*{headline}*\n<{item_url}|{item_key}>" if item_url else f"*{headline}*\n`{item_key}`"
 
+    # The badge line. `item_key` is already `owner/repo#142`-shaped, so the
+    # repo name is only repeated when it adds something the key does not.
+    crumbs = [f"{emoji} *{badge_label}*", f"`{item_key}`"]
+    if (facts or {}).get("repo") and (facts or {})["repo"] not in item_key:
+        crumbs.append(str(facts["repo"]))
     blocks: list[dict] = [
+        {"type": "context",
+         "elements": [{"type": "mrkdwn", "text": "  ·  ".join(crumbs)}]},
         {"type": "section", "text": {"type": "mrkdwn", "text": title}},
     ]
     if copilot and copilot.get("summary_tldr"):
+        # A Slack quote block: the closest thing Block Kit has to the
+        # console's set-apart summary panel. Newlines inside the summary are
+        # re-prefixed, because Slack only quotes the line the ">" starts.
+        quoted = str(copilot["summary_tldr"]).replace("\n", "\n> ")
         blocks.append({"type": "section",
-                       "text": {"type": "mrkdwn", "text": copilot["summary_tldr"]}})
+                       "text": {"type": "mrkdwn",
+                                "text": f"> \U0001f4dd *AI summary:* {quoted}"}})
     if ask:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ask}})
+
+    fields = _context_fields(alert_row, facts, copilot)
+    if fields:
+        blocks.append({"type": "context",
+                       "elements": [{"type": "mrkdwn", "text": "  ·  ".join(fields)}]})
+
     if alert_row.get("reason"):
         # sprint_filter's own evidence string, shown verbatim — same rule
         # slack_triage.compose_blocks follows: a wrong alert should be
@@ -353,16 +547,24 @@ def compose_blocks(alert_row: dict, item_key: str, item_url: Optional[str],
                        "elements": [{"type": "mrkdwn", "text": f"_{alert_row['reason']}_"}]})
 
     val = _button_value(alert_row, copilot)
+    blocks.append({"type": "divider"})
     blocks.append({
         "type": "actions",
         "block_id": "argus_triage_actions",
         "elements": [
-            {"type": "button", "action_id": ACTION_HANDLED_OFFLINE,
-             "text": {"type": "plain_text", "text": "Handled offline"}, "value": val},
-            {"type": "button", "action_id": ACTION_BLOCKED_ON,
-             "text": {"type": "plain_text", "text": "Blocked on…"}, "value": val},
+            # Order and emoji match the console's own triage control order.
+            # `style: primary` is Slack's only green, and it is spent on the
+            # one action that closes the loop — the same emphasis the console
+            # gives its primary triage button.
+            {"type": "button", "action_id": ACTION_HANDLED_OFFLINE, "style": "primary",
+             "text": {"type": "plain_text", "text": "\u2705 Handled offline",
+                      "emoji": True}, "value": val},
             {"type": "button", "action_id": ACTION_SNOOZE_7D,
-             "text": {"type": "plain_text", "text": "Snooze 7d"}, "value": val},
+             "text": {"type": "plain_text", "text": "\u23f0 Snooze 7d",
+                      "emoji": True}, "value": val},
+            {"type": "button", "action_id": ACTION_BLOCKED_ON,
+             "text": {"type": "plain_text", "text": "\U0001f6ab Blocked on\u2026",
+                      "emoji": True}, "value": val},
         ],
     })
     return blocks
@@ -476,7 +678,9 @@ def dispatch_one(conn, tenant_id: str, integration_id: int, alert_row: dict, now
         posted = transport.call(
             "chat.postMessage", channel=channel_id,
             text=compose_fallback_text(alert_row, item_key),
-            blocks=compose_blocks(alert_row, item_key, item_url, copilot))
+            blocks=compose_blocks(alert_row, item_key, item_url, copilot,
+                                  collect_status_facts(conn, alert_row.get("work_item_id"),
+                                                       now)))
         message_ts = posted.get("ts")
         if not message_ts:
             return DispatchResult(**base, outcome=FAILED, reason="no_message_ts",
