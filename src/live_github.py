@@ -50,6 +50,17 @@ Both verified against GitHub's current REST docs directly, same house rule
 as the six above (D-111's Jira/Linear field-name bugs are why this project
 checks rather than remembers).
 
+Milestone 1 / Task 3 adds two more, the CI-state pair D-161 named as the
+reason Pattern 1 could never fire in live ingestion:
+    GET /repos/{owner}/{repo}/commits/{sha}/status
+    GET /repos/{owner}/{repo}/commits/{sha}/check-runs
+Both are fetched for a PR's HEAD commit sha, and both are read rather than
+picking one, because a repo may report CI through the legacy Commit Status
+API, the newer Checks API, or both -- reading only one would report
+'unknown' for every repo that happens to use the other. The merge rule
+lives in `ingest.map_checks_state`, not here; this module still only ever
+fetches and hands raw JSON to the bundle.
+
 STILL NOT LIVE-TESTED, confirmed again at 7.4c-b, not just carried over
 from 6.9. D-121 found this sandbox gets a structural 403 from Anthropic's
 own session infrastructure on any call to api.github.com, regardless of
@@ -239,6 +250,30 @@ def fetch_work_item(owner: str, repo: str, number: int, token: str,
             bundle, f"{API_ROOT}/repos/{owner}/{repo}/pulls/{number}/reviews",
             token, "reviews", requested_at)
         bundle.reviews_json = reviews if isinstance(reviews, list) else []
+
+        # CI state for the PR's HEAD commit (Milestone 1 / Task 3).
+        #
+        # Guarded on the sha actually being there rather than assumed: the
+        # `pulls/{number}` call above can legitimately return None (every
+        # retry exhausted, or a 404 on an item that is not really a PR),
+        # and every pre-existing caller and test fixture in this project
+        # predates this block and supplies no `head` at all. In both cases
+        # the two calls below are simply not made, `status_json` and
+        # `check_runs_json` stay None, and `ingest.map_checks_state`
+        # returns 'unknown' -- the same readiness row this codebase
+        # produced before this feature existed. Not looking must keep
+        # reading as 'we did not look'.
+        head_sha = ((pr or {}).get("head") or {}).get("sha") if isinstance(pr, dict) else None
+        if head_sha:
+            status = _get_with_retry(
+                bundle, f"{API_ROOT}/repos/{owner}/{repo}/commits/{head_sha}/status",
+                token, "commit_status", requested_at)
+            bundle.status_json = status if isinstance(status, dict) else None
+
+            check_runs = _get_with_retry(
+                bundle, f"{API_ROOT}/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
+                token, "check_runs", requested_at)
+            bundle.check_runs_json = check_runs if isinstance(check_runs, dict) else None
 
     return bundle
 
