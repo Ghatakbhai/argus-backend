@@ -22,102 +22,59 @@ import json
 import sys
 import urllib.parse
 
+from . import web_theme
 from .github_app import build_manifest
 
+PAGE_CSS = """\
+/* Page-specific only — everything else comes from web_theme.CSS. */
+.choice{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;margin:0 0 var(--s4)}
+.choice label{display:flex;gap:7px;align-items:center;cursor:pointer;font-size:13px;
+              color:var(--text-secondary)}
+input[type=text]{
+  font-family:var(--font);font-size:13px;height:36px;padding:0 11px;flex:1;min-width:190px;
+  border:1px solid var(--border-subtle);border-radius:var(--radius-sm);
+  background:var(--bg-primary);color:var(--text-primary);
+}
+input[type=text]:focus{border-color:var(--border-active);outline:none}
+input[type=text]:disabled{opacity:.4}
+input[type=radio]{accent-color:var(--info-solid)}
+"""
+
 TEMPLATE = """<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Create the ARGUS GitHub App</title>
 <style>
-  :root {{
-    --bg: #f6f7f9; --card: #ffffff; --ink: #14171a; --muted: #5b6572;
-    --line: #dfe3e8; --accent: #1f6feb; --accent-ink: #ffffff;
-    --ok-bg: #e8f5ec; --ok-line: #b7dfc4; --ok-ink: #17612f;
-    --warn-bg: #fff6e0; --warn-line: #f0d9a0; --warn-ink: #6b4e00;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #0f1216; --card: #171b21; --ink: #e8ecf1; --muted: #9aa4b2;
-      --line: #2a313a; --accent: #4c8dff; --accent-ink: #0b0e12;
-      --ok-bg: #12301d; --ok-line: #2c5c3c; --ok-ink: #9fe0b5;
-      --warn-bg: #2e2612; --warn-line: #5c4a1f; --warn-ink: #f0d9a0;
-    }}
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; padding: 32px 20px 64px; background: var(--bg); color: var(--ink);
-    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  }}
-  .wrap {{ max-width: 680px; margin: 0 auto; }}
-  .card {{
-    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-    padding: 28px; margin-bottom: 20px;
-  }}
-  h1 {{ font-size: 25px; margin: 0 0 6px; letter-spacing: -0.01em; }}
-  h2 {{ font-size: 15px; margin: 0 0 12px; text-transform: uppercase;
-       letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }}
-  p {{ margin: 0 0 14px; }}
-  .sub {{ color: var(--muted); margin-bottom: 0; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 15px; }}
-  td {{ padding: 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }}
-  tr:last-child td {{ border-bottom: 0; }}
-  td.k {{ color: var(--muted); width: 42%; padding-right: 16px; }}
-  code {{
-    font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
-    padding: 1px 5px; word-break: break-all;
-  }}
-  .pill {{
-    display: inline-block; font-size: 12.5px; font-weight: 600; padding: 2px 9px;
-    border-radius: 999px; background: var(--ok-bg); color: var(--ok-ink);
-    border: 1px solid var(--ok-line); letter-spacing: 0.02em;
-  }}
-  button {{
-    font: 600 17px/1 inherit; background: var(--accent); color: var(--accent-ink);
-    border: 0; border-radius: 9px; padding: 16px 26px; cursor: pointer; width: 100%;
-  }}
-  button:hover {{ filter: brightness(1.08); }}
-  .choice {{ display: flex; gap: 12px; align-items: center; margin-bottom: 16px;
-            flex-wrap: wrap; font-size: 15px; }}
-  .choice label {{ display: flex; gap: 7px; align-items: center; cursor: pointer; }}
-  input[type=text] {{
-    font: 15px/1 inherit; padding: 9px 11px; border: 1px solid var(--line);
-    border-radius: 7px; background: var(--bg); color: var(--ink); flex: 1; min-width: 190px;
-  }}
-  input[type=text]:disabled {{ opacity: 0.45; }}
-  .note {{
-    background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn-ink);
-    border-radius: 9px; padding: 14px 16px; font-size: 14.5px; margin: 0;
-  }}
-  ol {{ margin: 0; padding-left: 22px; }}
-  ol li {{ margin-bottom: 9px; }}
-  ol li:last-child {{ margin-bottom: 0; }}
-</style>
+{css}
+{page_css}</style>
 </head>
 <body>
 <div class="wrap">
+{brandbar}
 
-  <div class="card">
-    <h1>Create the ARGUS GitHub App</h1>
+  <div class="card card--info">
+    <span class="badge badge-info"><span class="dot"></span>Step 1 of 2</span>
+    <h1 style="margin-top:var(--s3)">Create the ARGUS GitHub App</h1>
     <p class="sub">One click. This page hands GitHub a pre-filled description of
-    the app — you review GitHub's own confirmation screen, and GitHub sends the
-    credentials straight back to your Render service.</p>
+    the app &mdash; you review GitHub&rsquo;s own confirmation screen, and GitHub sends
+    the credentials straight back to your Render service.</p>
   </div>
 
   <div class="card">
     <h2>What ARGUS is asking for</h2>
     <table>
-      <tr><td class="k">Repository contents</td><td><span class="pill">Read only</span></td></tr>
-      <tr><td class="k">Issues</td><td><span class="pill">Read only</span></td></tr>
-      <tr><td class="k">Pull requests</td><td><span class="pill">Read only</span></td></tr>
-      <tr><td class="k">Metadata</td><td><span class="pill">Read only</span></td></tr>
+      <tr><td class="k">Repository contents</td><td><span class="badge badge-ok">Read only</span></td></tr>
+      <tr><td class="k">Issues</td><td><span class="badge badge-ok">Read only</span></td></tr>
+      <tr><td class="k">Pull requests</td><td><span class="badge badge-ok">Read only</span></td></tr>
+      <tr><td class="k">Metadata</td><td><span class="badge badge-ok">Read only</span></td></tr>
     </table>
-    <p style="margin:16px 0 0;font-size:14.5px;color:var(--muted)">
-    Every permission is read-only — there is no write access of any kind in this
-    list. ARGUS cannot comment, close, merge, assign, or change anything in your
-    repositories, which is the same rule the project has held since day one.</p>
+    <p style="margin-top:var(--s4)">Every permission is read-only &mdash; there is no
+    write access of any kind in this list. ARGUS cannot comment, close, merge, assign,
+    or change anything in your repositories, which is the same rule the project has
+    held since day one.</p>
   </div>
 
   <div class="card">
@@ -126,7 +83,7 @@ TEMPLATE = """<!doctype html>
       <tr><td class="k">Webhook</td><td><code>{base}/v1/webhooks/github</code></td></tr>
       <tr><td class="k">After creation</td><td><code>{base}/v1/admin/github/callback</code></td></tr>
       <tr><td class="k">After install</td><td><code>{base}/v1/github/setup</code></td></tr>
-      <tr><td class="k">Visibility</td><td>Private — only you can install it</td></tr>
+      <tr><td class="k">Visibility</td><td>Private &mdash; only you can install it</td></tr>
     </table>
   </div>
 
@@ -147,7 +104,8 @@ TEMPLATE = """<!doctype html>
       <input type="text" id="org" placeholder="organization name" disabled>
     </div>
 
-    <button type="button" id="go">Create ARGUS GitHub App on GitHub &rarr;</button>
+    <button type="button" id="go" class="btn btn-primary btn-lg">
+      Create ARGUS GitHub App on GitHub &rarr;</button>
   </div>
 
   <div class="card">
@@ -158,16 +116,15 @@ TEMPLATE = """<!doctype html>
       <li>GitHub creates the app and redirects to your Render service, which
       shows four secrets <strong>once</strong>.</li>
       <li>Copy those four into Render &rarr; Environment, then restart the
-      service. Send me a message and I'll take it from there.</li>
+      service. Send me a message and I&rsquo;ll take it from there.</li>
     </ol>
   </div>
 
-  <div class="card" style="padding:18px 20px">
-    <p class="note"><strong>Keep this file to yourself.</strong> It carries the
-    one-time setup key that authorises creating the app. Don't upload it to
-    GitHub, and delete it once the app exists — it has no further use.</p>
-  </div>
+  <div class="warn"><b>Keep this file to yourself.</b> It carries the one-time setup
+  key that authorises creating the app. Don&rsquo;t upload it to GitHub, and delete it
+  once the app exists &mdash; it has no further use.</div>
 
+{footer}
 </div>
 <script>
   var org = document.getElementById('org');
@@ -195,19 +152,28 @@ TEMPLATE = """<!doctype html>
 """
 
 
-def main() -> None:
-    if len(sys.argv) != 4:
-        print(__doc__)
-        raise SystemExit(2)
-    base_url, setup_secret, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+def render(base_url: str, setup_secret: str) -> str:
+    """The page as a string. Split out of `main()` so the styling can be
+    checked without writing a file that carries a live setup secret."""
     base_url = base_url.rstrip("/")
-
-    page = TEMPLATE.format(
+    return TEMPLATE.format(
+        css=web_theme.CSS,
+        page_css=PAGE_CSS,
+        brandbar=web_theme.brandbar("github app"),
+        footer=web_theme.FOOTER_HTML,
         base=html.escape(base_url),
         state=urllib.parse.quote(setup_secret, safe=""),
         manifest=html.escape(json.dumps(build_manifest(base_url), separators=(",", ":")),
                              quote=True),
     )
+
+
+def main() -> None:
+    if len(sys.argv) != 4:
+        print(__doc__)
+        raise SystemExit(2)
+    base_url, setup_secret, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    page = render(base_url, setup_secret)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(page)
     print(f"wrote {out_path} ({len(page)} bytes)")
