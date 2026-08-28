@@ -30,7 +30,8 @@ _admin_pool: ConnectionPool | None = None
 # REPLACE, or guarded by a catalogue lookup — because it will be re-run every
 # time the service restarts.
 INCREMENTAL_MIGRATIONS = ("schema_7_3_slack.sql", "schema_owner_rls_bypass.sql",
-                          "schema_7_4_dashboard.sql", "schema_7_4c_ingest_worker.sql")
+                          "schema_7_4_dashboard.sql", "schema_7_4c_ingest_worker.sql",
+                          "schema_identity_resolution.sql")
 
 
 def bootstrap_schema_if_needed() -> bool:
