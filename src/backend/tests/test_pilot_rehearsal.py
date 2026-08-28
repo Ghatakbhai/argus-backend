@@ -118,16 +118,24 @@ def _github_rest_rules():
     alongside the two FIREs — a pilot's real first night is never 100%
     FIRE, and the dashboard has to be honest about the mix.
     """
-    def _pr(number, title, repo):
+    def _pr(number, title, repo, *, merged=False):
+        """`merged=True` (Phase 7.4X) produces a pull request GitHub itself
+        reports as merged and closed, with no live review request on it —
+        the Ghost State Case A shape, driven through the real ingestion path
+        rather than written into the database by hand."""
+        state = "closed" if merged else "open"
+        closed = '"closed_at":"2026-08-05T00:00:00Z",' if merged else ""
         issue = (
-            ('{"number":%d,"title":"%s","user":{"login":"amy"},"state":"open",'
-             '"created_at":"2026-08-01T00:00:00Z","labels":[],'
+            ('{"number":%d,"title":"%s","user":{"login":"amy"},"state":"%s",'
+             '"created_at":"2026-08-01T00:00:00Z","labels":[],%s'
              '"html_url":"https://github.com/pilotco/%s/pull/%d",'
              '"updated_at":"2026-08-02T00:00:00Z","pull_request":{},"assignees":[]}'
-             % (number, title, repo, number)).encode()
+             % (number, title, state, closed, repo, number)).encode()
         )
-        pr = b'{"draft":false,"merged":false,"state":"open","mergeable_state":"clean"}'
+        pr = ('{"draft":false,"merged":%s,"state":"%s","mergeable_state":"clean"}'
+              % ("true" if merged else "false", state)).encode()
         timeline = (
+            b'[]' if merged else
             b'[{"event":"review_requested","actor":{"login":"amy"},'
             b'"requested_reviewer":{"login":"riya"},"created_at":"2026-08-02T00:00:00Z"}]'
         )
@@ -145,13 +153,18 @@ def _github_rest_rules():
                  b'{"name":"widgets","full_name":"pilotco/widgets","owner":{"login":"pilotco"}},'
                  b'{"name":"gadgets","full_name":"pilotco/gadgets","owner":{"login":"pilotco"}}]}'),
         "pilotco/widgets/pulls?state=open": _FakeHTTPResponse(
-            200, b'[{"number":42,"title":"x"},{"number":43,"title":"x"}]'),
+            200, b'[{"number":42,"title":"x"},{"number":43,"title":"x"},'
+                 b'{"number":44,"title":"x"}]'),
         "pilotco/gadgets/pulls?state=open": _FakeHTTPResponse(
             200, b'[{"number":9,"title":"x"}]'),
     }
     rules.update(_pr(42, "[JIR-9] Fix the export timeout", "widgets"))
     rules.update(_pr(43, "[ENG-77] Rework the retry queue", "widgets"))
     rules.update(_pr(9, "Tidy up the README", "gadgets"))  # no ticket key at all
+    # Phase 7.4X, Task 1.4's integration case: merged on 2026-08-05, linked
+    # to JIR-9 — which the Jira fixture above still reports as 'In Progress'
+    # in the active Sprint 3. Ghost State Case A, end to end.
+    rules.update(_pr(44, "[JIR-9] Ship the export fix", "widgets", merged=True))
     return rules
 
 
@@ -271,16 +284,25 @@ def test_one_fully_wired_fake_tenant_webhook_to_dashboard(client):
     alerts = client.get("/v1/alerts?limit=50", headers=tenant_headers)
     assert alerts.status_code == 200, alerts.text
     rows = alerts.json()
-    assert len(rows) == 3, rows
+    assert len(rows) == 4, rows
     by_reason = {r["reason"]: r for r in rows}
     fires = [r for r in rows if r["outcome"] == "FIRE"]
     suppressed = [r for r in rows if r["outcome"] == "SUPPRESSED"]
-    assert len(fires) == 2, rows
+    assert len(fires) == 3, rows
     assert len(suppressed) == 1, rows
     assert suppressed[0]["reason"] == "no_ticket_link"
 
     fire_keys = {r["item_key"] for r in fires}
-    assert fire_keys == {"pilotco/widgets#42", "pilotco/widgets#43"}, fire_keys
+    assert fire_keys == {"pilotco/widgets#42", "pilotco/widgets#43",
+                         "pilotco/widgets#44"}, fire_keys
+    # Phase 7.4X, Task 1.4: the Ghost State detector, proven on the full
+    # chain — a real signed GitHub webhook, the real poller, real (mocked-
+    # transport) GitHub + Jira ingestion, and the pilot's own API key
+    # reading it back over HTTP. Nothing here writes a work_item or a
+    # ticket_link by hand.
+    ghost = [r for r in fires if r["item_key"] == "pilotco/widgets#44"][0]
+    assert ghost["pattern"] == "P3-ghost-state", ghost
+    assert "JIR-9" in ghost["detail"] and "In Progress" in ghost["detail"], ghost
     for r in rows:
         assert r["item_key"] and "#" in r["item_key"], r
         assert r["title"], r
@@ -297,14 +319,24 @@ def test_one_fully_wired_fake_tenant_webhook_to_dashboard(client):
     assert any(m["source_key"] == "amy" for m in me_body["members"]), me_body["members"]
 
     # 6c. /v1/digests/latest?format=json: the full structured envelope,
-    # counting a real 2-FIRE, 1-SUPPRESSED night correctly.
+    # counting a real 3-FIRE, 1-SUPPRESSED night correctly.
     digest_json = client.get("/v1/digests/latest?format=json", headers=tenant_headers)
     assert digest_json.status_code == 200, digest_json.text
     payload_json = digest_json.json()
     assert payload_json["tenant"]["slug"] == slug
-    assert payload_json["digest"]["counts"]["fired"] == 2, payload_json["digest"]["counts"]
+    assert payload_json["digest"]["counts"]["fired"] == 3, payload_json["digest"]["counts"]
     assert payload_json["digest"]["counts"]["suppressed"] == 1, payload_json["digest"]["counts"]
-    assert payload_json["digest"]["counts"]["items_checked"] == 3
+    assert payload_json["digest"]["counts"]["items_checked"] == 4
+
+    # Phase 7.4X, Task 3.4: the morning briefing on a live payload read back
+    # over HTTP by a pilot's own key. No ARGUS_LLM_API_KEY is configured in
+    # this suite, so this is the deterministic path — which is exactly the
+    # path a pilot team runs on until Dirgh sets a key, and it must still be
+    # a briefing rather than a missing field or a null.
+    brief = payload_json["morning_briefing"]
+    assert brief["source"] == "deterministic", brief
+    assert brief["briefing_summary"], brief
+    assert isinstance(brief["healthy_count"], int), brief
 
     # Milestone 2, Task 6.2: every row carries a `copilot` key (Task 5.1/5.3
     # — the field exists in the real, live-shaped payload, not just in a
