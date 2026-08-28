@@ -348,11 +348,17 @@ def resolve_identity(conn: sqlite3.Connection,
 PATTERN_HEADLINE = {
     "P1-approved-unmerged": "This PR is approved and still unmerged",
     "P2-review-ghosted": "This PR is waiting on your review",
+    "P3-ghost-state": "GitHub and the ticket board disagree about this",
+    "P4-reviewer-ooo-sprint-end": "Your reviewer is away and the cycle is closing",
 }
 
 PATTERN_ASK = {
     "P1-approved-unmerged": "It has an approval and CI is green — is something holding the merge?",
     "P2-review-ghosted": "A review was requested and there has been no response yet.",
+    "P3-ghost-state": "The pull request and the linked ticket are in states that "
+                      "cannot both be current — worth a look at which one is stale.",
+    "P4-reviewer-ooo-sprint-end": "The requested reviewer is out of office and nobody "
+                                  "else has been asked to cover it yet.",
 }
 
 
