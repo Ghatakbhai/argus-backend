@@ -57,6 +57,7 @@ if _SRC not in sys.path:
 
 import digest as D  # noqa: E402
 import presence as P  # noqa: E402
+from . import llm_copilot  # noqa: E402 — Milestone 2 (D-172)
 import sprint_filter as SF  # noqa: E402
 
 _CI_LABEL = {"clean": "green", "blocked": "red", "unknown": "unknown"}
@@ -161,6 +162,60 @@ def _evidence_detail(conn: sqlite3.Connection, res: SF.FilterResult, now: str,
     d["presence"] = _presence_str(conn, row.person, now)
     d["timeline"] = _timeline(conn, res.work_item_id, now, row)
     return d
+
+
+def _recent_comments(conn: sqlite3.Connection, wid: int, limit: int = 5) -> list[str]:
+    """The "recent 3-5 review comments" Milestone 2 Task 2.1 asks for.
+    Human/AI-drafted only — a bot's own status-check comment is not the
+    conversational context a TL;DR should be summarizing (same
+    `authorship` vocabulary D-057 already established for comment.py)."""
+    rows = conn.execute(
+        "SELECT body FROM comment WHERE work_item_id = ? AND authorship != 'bot'"
+        " ORDER BY created_at DESC LIMIT ?", (wid, limit)).fetchall()
+    return [r[0] for r in reversed(rows) if r[0]]
+
+
+def _ticket_keys(conn: sqlite3.Connection, wid: int) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT t.source_key FROM ticket_link tl JOIN ticket t ON t.id = tl.ticket_id"
+        " WHERE tl.work_item_id = ?", (wid,)).fetchall()]
+
+
+def _reviewer_logins(conn: sqlite3.Connection, wid: int) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT a.source_key FROM event e JOIN actor a ON a.id = e.actor_id"
+        " WHERE e.work_item_id = ? AND e.type IN ('review_requested', 'review_submitted')"
+        "   AND a.source_key IS NOT NULL", (wid,)).fetchall()]
+
+
+def _copilot_enrichment(conn: sqlite3.Connection, res: SF.FilterResult, row: D.DigestRow,
+                        evidence: str) -> Optional[dict]:
+    """Milestone 2, Tasks 2.1-2.4/3.1-3.3: assembles this FIRE item's
+    context and calls the LLM copilot layer exactly once. Computed here, at
+    digest-build time (once per ingest run, per FIRE item), and persisted
+    into `payload_json` by the caller — this IS the caching Task 4.3 asks
+    for; there is no separate cache table because there is nothing to key
+    one by that `digest_delivery.payload_json` does not already provide.
+    Returns `None` with zero side effects if `ARGUS_LLM_API_KEY` is unset or
+    the call fails for any reason — `llm_copilot.generate_enrichment`'s own
+    Fail-Safe Fallback Invariant, unchanged here."""
+    wid = res.work_item_id
+    wrow = conn.execute("SELECT title, body, author_id FROM work_item WHERE id = ?",
+                        (wid,)).fetchone()
+    if wrow is None:
+        return None
+    title, body, author_id = wrow
+    author_login = None
+    if author_id is not None:
+        arow = conn.execute("SELECT source_key FROM actor WHERE id = ?", (author_id,)).fetchone()
+        author_login = arow[0] if arow else None
+
+    ctx = llm_copilot.build_context(
+        item_key=res.item_key, pattern=res.pattern, title=title or "", body=body or "",
+        comments=_recent_comments(conn, wid), ticket_keys=_ticket_keys(conn, wid),
+        evidence=evidence, author_login=author_login,
+        reviewer_logins=_reviewer_logins(conn, wid))
+    return llm_copilot.generate_enrichment(ctx)
 
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -294,6 +349,14 @@ def build_dashboard_payload(
         rd["evidence_detail"] = _evidence_detail(conn, res, now, row) if res else None
         rd["blocker_text"] = row.headline if row.section == D.SECTION_BLOCKED else None
         rd["cluster"] = None
+        # Milestone 2, Task 5.1: embedded per-row, alongside evidence_detail,
+        # not as one top-level dict — the natural home for something a
+        # single Slack DM or dashboard card renders about ONE item.
+        # Computed only for FIRE rows (`res` is None otherwise, per `live`
+        # above): SUPPRESSED/ABSTAIN items were never going to reach a
+        # person, so there is nothing for a copilot to summarize FOR.
+        rd["copilot"] = (_copilot_enrichment(conn, res, row, res.evidence)
+                         if res else None)
         row_dicts.append(rd)
 
     clusters = _clusters(row_dicts)
