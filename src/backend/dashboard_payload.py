@@ -61,6 +61,19 @@ import sprint_filter as SF  # noqa: E402
 
 _CI_LABEL = {"clean": "green", "blocked": "red", "unknown": "unknown"}
 
+# Milestone 1, Task 5.4. Not every ABSTAIN reason means the same thing to a
+# lead reading the audit drawer: most are a clean, confident non-match (a
+# closed issue, a draft PR, a reviewer who already responded) and are
+# correctly silent. A specific few mean "we could not tell" — a coverage
+# gap, not a verdict — and CONTRACT.md §4 already named exactly one of them
+# (`no_readable_clock`, the existing `held_candidates` count) as the real,
+# available case. `ci_not_known_green (unknown)` is the same kind of gap
+# (CI genuinely never reported, not CI that reported failure) and is added
+# here for the same reason. This classifies DISPLAY only — it changes no
+# outcome, no `alert.outcome` row, nothing `sprint_filter.py` decided.
+def _is_unknown_reason(reason: str) -> bool:
+    return reason == "no_readable_clock" or reason.startswith("ci_not_known_green (unknown)")
+
 
 def _ci_state(conn: sqlite3.Connection, wid: int) -> Optional[str]:
     row = conn.execute(
@@ -299,6 +312,25 @@ def build_dashboard_payload(
             "decided_at": now,
         })
 
+    # Milestone 1, Task 5.4: the item-level version of what `held_candidates`
+    # below has only ever counted. A lead could see "2 held" but never which
+    # two — the exact "silently dropped" gap 5.4 names. Same row shape as
+    # `suppressed_items` above, on purpose: the audit drawer already knows
+    # how to render that shape.
+    unknown_items = []
+    for res in results:
+        if res.outcome != SF.ABSTAIN or not _is_unknown_reason(res.reason):
+            continue
+        unknown_items.append({
+            "item_key": res.item_key,
+            "title": D._item_title(conn, res.work_item_id),
+            "url": D._item_url(conn, res.work_item_id),
+            "pattern": res.pattern,
+            "reason": res.reason,
+            "detail": res.evidence,
+            "decided_at": now,
+        })
+
     held_candidates = sum(1 for r in results
                           if r.outcome == SF.ABSTAIN and r.reason == "no_readable_clock")
     delivery_blockers = dig.counts.fired
@@ -329,7 +361,7 @@ def build_dashboard_payload(
     digest_dict["rows"] = row_dicts  # the enriched rows, not dig.as_dict()'s bare ones
 
     return {
-        "contract_version": "7.4b",
+        "contract_version": "7.4d",
         "generated_by": "src/backend/dashboard_payload.py",
         "tenant": {
             "slug": tenant_slug, "label": team_label,
@@ -340,4 +372,5 @@ def build_dashboard_payload(
         "clusters": clusters,
         "people_out": _people_out(conn, now),
         "suppressed_items": suppressed_items,
+        "unknown_items": unknown_items,
     }
