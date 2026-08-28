@@ -24,6 +24,11 @@ import urllib.error
 import urllib.request
 from datetime import timezone
 
+# Fix Windows console utf-8 encoding
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 # Default public Render service URL
 DEFAULT_BASE_URL = os.environ.get(
     "ARGUS_PUBLIC_BASE_URL", "https://argus-backend-2nv0.onrender.com"
